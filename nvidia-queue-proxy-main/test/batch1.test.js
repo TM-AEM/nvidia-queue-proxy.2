@@ -240,6 +240,61 @@ function createManualBody() {
   };
 }
 
+// A fully instrumented body source. Counts how many reader.read() calls were
+// initiated, lets the test resolve/reject each pending read on demand, and can
+// simulate a cancel() that never settles (a source that ignores cancellation).
+function createTrackedBody(options = {}) {
+  const { cancelNeverSettles = false } = options;
+  const reads = [];
+  const state = {
+    cancelCalled: false,
+    cancelNeverSettles,
+    readsStarted: 0,
+    readsResolved: 0,
+  };
+  const reader = {
+    read() {
+      state.readsStarted += 1;
+      return new Promise((resolve, reject) => {
+        reads.push({ resolve, reject });
+      });
+    },
+    cancel() {
+      state.cancelCalled = true;
+      if (cancelNeverSettles) return new Promise(() => {});
+      return Promise.resolve();
+    },
+  };
+  return {
+    body: { getReader: () => reader },
+    state,
+    resolveNext(value) {
+      const entry = reads.shift();
+      if (!entry) return false;
+      state.readsResolved += 1;
+      entry.resolve({ value, done: false });
+      return true;
+    },
+    closeNext() {
+      const entry = reads.shift();
+      if (!entry) return false;
+      state.readsResolved += 1;
+      entry.resolve({ value: undefined, done: true });
+      return true;
+    },
+    rejectNext(err) {
+      const entry = reads.shift();
+      if (!entry) return false;
+      state.readsResolved += 1;
+      entry.reject(err);
+      return true;
+    },
+    get pendingReads() {
+      return reads.length;
+    },
+  };
+}
+
 // ==========================================
 // T2 TESTS — Retry-After & Exponential Backoff
 // ==========================================
@@ -2496,4 +2551,187 @@ test("F1: REQUEST_BODY_TIMEOUT_MS defaults and bounds are enforced", () => {
   assert.throws(() => resolveConfig({ REQUEST_BODY_TIMEOUT_MS: "" }), ConfigError);
   assert.throws(() => resolveConfig({ REQUEST_BODY_TIMEOUT_MS: "   " }), ConfigError);
   assert.throws(() => resolveConfig({ REQUEST_BODY_TIMEOUT_MS: "Infinity" }), ConfigError);
+});
+
+// ==========================================
+// BATCH 1G.1 REGRESSION TESTS — Late body reads after timeout
+// ==========================================
+
+test("1G.1-A: A late read fulfillment after timeout is not retained and no further read is initiated", async () => {
+  const timers = createFakeTimers();
+  const tracked = createTrackedBody();
+  const fakeRequest = { headers: { get: () => null }, body: tracked.body };
+
+  const promise = readBoundedBody(fakeRequest, 1024, {
+    timeoutMs: 1_000,
+    setTimeoutImpl: (fn, ms) => timers.setTimeout(fn, ms),
+    clearTimeoutImpl: (id) => timers.clearTimeout(id),
+    cancelGraceMs: 500,
+  });
+  promise.catch(() => {});
+
+  await tick();
+  assert.equal(tracked.state.readsStarted, 1, "Exactly one read must be in flight");
+  assert.equal(tracked.pendingReads, 1);
+
+  // Deadline expires while the read is still pending.
+  timers.advance(1_000);
+  await tick();
+  assert.equal(tracked.state.cancelCalled, true, "Cancellation must be attempted on timeout");
+  timers.advance(500); // bounded cancel grace elapses -> handler settles with 408
+
+  await assert.rejects(() => promise, BodyReadTimeoutError);
+
+  const readsStartedAtTimeout = tracked.state.readsStarted;
+
+  // The pending read finally fulfills with a non-empty chunk AFTER the 408.
+  assert.equal(tracked.resolveNext(new Uint8Array([7, 7, 7])), true);
+  await tick();
+  await tick();
+
+  assert.equal(
+    tracked.state.readsStarted,
+    readsStartedAtTimeout,
+    "The loop must NOT initiate another read after timeout"
+  );
+  assert.equal(tracked.pendingReads, 0, "No new read may be left pending after timeout");
+});
+
+test("1G.1-B: A source that keeps producing after timeout is not consumed or retained, and never dispatches", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+  const tracked = createTrackedBody({ cancelNeverSettles: true });
+  let upstreamCalled = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    REQUEST_BODY_TIMEOUT_MS: 1_000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => {
+      upstreamCalled = true;
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = {
+    url: "https://proxy.internal/v1/chat/completions",
+    method: "POST",
+    headers: { get: () => null },
+    signal: undefined,
+    body: tracked.body,
+  };
+
+  const resPromise = rateGate.fetch(req);
+  await tick();
+  timers.advance(1_000); // deadline fires -> terminal state set
+  await tick(); // let the handler enter bounded cancellation (arms the grace timer)
+  timers.advance(1_000); // bounded cancel grace elapses (cancel() never settles)
+  const res = await resPromise;
+  assert.equal(res.status, 408);
+
+  const readsStartedAtTimeout = tracked.state.readsStarted;
+
+  // The source keeps producing: several late chunks become available.
+  for (let i = 0; i < 5; i++) {
+    tracked.resolveNext(new Uint8Array([i, i, i, i]));
+    await tick();
+  }
+  await tick();
+
+  assert.equal(
+    tracked.state.readsStarted,
+    readsStartedAtTimeout,
+    "The application-level loop must not consume successive late chunks"
+  );
+  assert.equal(upstreamCalled, false, "No upstream dispatch after a body timeout");
+  assert.equal(rateGate.activeTicket, null, "No queue slot acquired after a body timeout");
+  assert.equal(
+    await ctx.storage.get("rate-state"),
+    undefined,
+    "No rate-limit attempt accounting after a body timeout"
+  );
+});
+
+test("1G.1-C: A late read rejection after timeout causes no unhandled rejection or state corruption", async () => {
+  const timers = createFakeTimers();
+  const tracked = createTrackedBody();
+  const fakeRequest = { headers: { get: () => null }, body: tracked.body };
+
+  const promise = readBoundedBody(fakeRequest, 1024, {
+    timeoutMs: 1_000,
+    setTimeoutImpl: (fn, ms) => timers.setTimeout(fn, ms),
+    clearTimeoutImpl: (id) => timers.clearTimeout(id),
+    cancelGraceMs: 500,
+  });
+  promise.catch(() => {});
+
+  await tick();
+  timers.advance(1_000);
+  timers.advance(500);
+  await assert.rejects(() => promise, BodyReadTimeoutError);
+
+  // The pending read rejects only after the timeout already settled.
+  assert.equal(tracked.rejectNext(new Error("late source failure")), true);
+  await tick();
+  await tick();
+  // Reaching here without the runner flagging an unhandled rejection is the assertion.
+  assert.equal(tracked.state.readsStarted, 1, "No further read may be initiated");
+});
+
+test("1G.1-D1: Successful completion before the deadline is accepted and no terminal action is duplicated", async () => {
+  const timers = createFakeTimers();
+  const tracked = createTrackedBody();
+  const fakeRequest = { headers: { get: () => null }, body: tracked.body };
+
+  const promise = readBoundedBody(fakeRequest, 1024, {
+    timeoutMs: 5_000,
+    setTimeoutImpl: (fn, ms) => timers.setTimeout(fn, ms),
+    clearTimeoutImpl: (id) => timers.clearTimeout(id),
+    cancelGraceMs: 500,
+  });
+
+  await tick();
+  tracked.resolveNext(new Uint8Array([1, 2, 3]));
+  await tick();
+  tracked.closeNext();
+  const result = await promise;
+  assert.deepEqual(Array.from(result), [1, 2, 3]);
+  assert.equal(timers.pendingCount(), 0, "The deadline timer must be cleared on completion");
+  assert.equal(tracked.state.cancelCalled, false, "No cancellation on the success path");
+
+  // A late timer must not retroactively cancel a completed request.
+  timers.advance(10_000);
+  assert.equal(tracked.state.cancelCalled, false, "A late deadline must not cancel a completed read");
+});
+
+test("1G.1-D2: A timeout winning first cannot be reversed by a late read completion", async () => {
+  const timers = createFakeTimers();
+  const tracked = createTrackedBody();
+  const fakeRequest = { headers: { get: () => null }, body: tracked.body };
+
+  const promise = readBoundedBody(fakeRequest, 1024, {
+    timeoutMs: 1_000,
+    setTimeoutImpl: (fn, ms) => timers.setTimeout(fn, ms),
+    clearTimeoutImpl: (id) => timers.clearTimeout(id),
+    cancelGraceMs: 500,
+  });
+  promise.catch(() => {});
+
+  await tick();
+  timers.advance(1_000); // timeout wins the race
+  await tick();
+  // Late completion arrives before the bounded cancel grace has elapsed.
+  tracked.closeNext();
+  await tick();
+  timers.advance(500);
+
+  await assert.rejects(() => promise, BodyReadTimeoutError, "The timeout outcome must stand");
+  assert.equal(timers.pendingCount(), 0, "No timer may remain after the terminal path");
 });

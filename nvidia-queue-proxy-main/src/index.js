@@ -266,16 +266,29 @@ export async function readBoundedBody(request, maxBytes, options = {}) {
   let total = 0;
   let timer = null;
 
-  // A total-deadline timer, armed once for the entire read. On expiry it only
-  // resolves the race promise; the read loop is never mutated by the callback,
-  // so there is no race where both the timer and the loop change state.
+  // Shared terminal state for the whole body-read operation. Once `stopped` is
+  // set, the read loop must not retain another chunk or initiate another read,
+  // even if a previously-pending reader.read() settles later or the underlying
+  // source ignores cancellation. The deadline callback sets it synchronously,
+  // before the timeout outcome is resolved, so a late read observes it at once.
+  const terminal = { stopped: false };
+
+  // A total-deadline timer, armed once for the entire read. It never restarts
+  // per chunk, so a slow client cannot keep a request alive forever.
   const deadline = new Promise((resolve) => {
-    timer = setTimeoutImpl(resolve, timeoutMs);
+    timer = setTimeoutImpl(() => {
+      terminal.stopped = true;
+      resolve();
+    }, timeoutMs);
   });
 
   const readDone = (async () => {
     for (;;) {
       const { done, value } = await reader.read();
+      // Check the terminal state immediately after every awaited read -- before
+      // inspecting the chunk, updating the byte counter, retaining the chunk, or
+      // issuing another read. This is what stops late processing after timeout.
+      if (terminal.stopped) return;
       if (done) break;
       total += value.byteLength;
       if (total > maxBytes) {
@@ -284,16 +297,17 @@ export async function readBoundedBody(request, maxBytes, options = {}) {
       chunks.push(value);
     }
   })();
-  // Mark the loop promise handled so a racing timeout cannot leave it as an
-  // unhandled rejection.
+  // Mark the loop promise handled so a racing timeout or a late rejection can
+  // never surface as an unhandled rejection.
   readDone.catch(() => {});
 
   const outcome = await Promise.race([
     readDone.then(() => ({ kind: "done" })),
     deadline.then(() => ({ kind: "timeout" })),
   ]).catch(async (readError) => {
-    // The read loop rejected (oversized body or a source error). Always clear
-    // the deadline timer, then best-effort cancel, then surface the failure.
+    // The read loop rejected (oversized body or a source error). Stop the loop,
+    // clear the deadline timer, best-effort cancel, then surface the failure.
+    terminal.stopped = true;
     clearTimeoutImpl(timer);
     await cancelReaderBounded(reader, readError, setTimeoutImpl, clearTimeoutImpl, cancelGraceMs);
     throw readError;

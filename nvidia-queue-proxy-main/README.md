@@ -44,9 +44,11 @@ rejected with `413`.
 
 `REQUEST_BODY_TIMEOUT_MS` is a single total deadline covering the entire body
 read; it does not restart after each chunk, so a slow client cannot keep a
-request alive indefinitely. On expiry the read is stopped and best-effort
-cancellation is initiated, and the request fails with HTTP `408`. All timers are
-cleared on every settled path.
+request alive indefinitely. On expiry the read loop transitions to a terminal
+state and stops retaining or requesting further data; best-effort cancellation is
+initiated, and the request fails with HTTP `408`. Any read that settles after the
+deadline is discarded and never re-enters the queue or dispatches upstream. All
+timers are cleared on every terminal path.
 
 Rejected bodies (too large, timed out, or unreadable) never acquire a FIFO
 queue ticket, never update upstream attempt accounting, and never call the
