@@ -11,13 +11,22 @@ const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_QUEUE_WAIT_MS = 60_000;
 const DEFAULT_MAX_QUEUE_DEPTH = 100;
 const DEFAULT_MAX_BODY_BYTES = 20 * 1024 * 1024; // 20 MiB
+const DEFAULT_REQUEST_BODY_TIMEOUT_MS = 30_000;
 
 // Safe upper bounds. Timer-based settings share a 24h ceiling to prevent
 // setTimeout overflow; counters get independent ceilings to bound memory.
 const MAX_TIMEOUT_MS = 86_400_000;
 const MAX_RPM_LIMIT = 100_000;
 const MAX_QUEUE_DEPTH_LIMIT = 100_000;
-const MAX_BODY_BYTES_LIMIT = 1_073_741_824; // 1 GiB
+// The request body is fully buffered in memory before dispatch, so the
+// configurable ceiling cannot exceed the safe default.
+const MAX_BODY_BYTES_LIMIT = DEFAULT_MAX_BODY_BYTES; // 20 MiB
+const MIN_REQUEST_BODY_TIMEOUT_MS = 1_000;
+const MAX_REQUEST_BODY_TIMEOUT_MS = 120_000;
+// Bounded grace for best-effort body-reader cancellation after a timeout or
+// read failure. This only bounds how long we wait; it never proves the source
+// stopped.
+const DEFAULT_BODY_CANCEL_GRACE_MS = 1_000;
 
 // Single source of truth for every environment setting the Worker reads.
 // `envNames` lists the accepted names in priority order (canonical first,
@@ -79,6 +88,14 @@ const CONFIG_SPECS = {
     max: MAX_BODY_BYTES_LIMIT,
     integer: true,
     allowZero: true,
+  },
+  REQUEST_BODY_TIMEOUT_MS: {
+    envNames: ["REQUEST_BODY_TIMEOUT_MS"],
+    default: DEFAULT_REQUEST_BODY_TIMEOUT_MS,
+    min: MIN_REQUEST_BODY_TIMEOUT_MS,
+    max: MAX_REQUEST_BODY_TIMEOUT_MS,
+    integer: true,
+    allowZero: false,
   },
 };
 
@@ -177,11 +194,60 @@ export class BodyTooLargeError extends Error {
   }
 }
 
-// Reads the request body while enforcing a hard byte ceiling. Content-Length is
-// checked first (cheap early rejection) but is never trusted on its own: the
-// actual streamed bytes are counted, so missing or understated length headers
-// cannot bypass the limit. The exact bytes are preserved for valid requests.
-export async function readBoundedBody(request, maxBytes) {
+export class BodyReadTimeoutError extends Error {
+  constructor() {
+    super("Request body read timed out");
+    this.name = "BodyReadTimeoutError";
+  }
+}
+
+// Best-effort cancellation of a body reader. The returned promise settles
+// quickly whether or not the underlying stream honors cancellation: it races
+// the cancel() promise against a bounded grace period. A never-settling
+// cancel() therefore cannot block the response, and any rejection is swallowed
+// so it never becomes an unhandled rejection. Note this only bounds waiting --
+// it cannot prove that an uncooperative source has actually stopped producing.
+function cancelReaderBounded(reader, reason, setTimeoutImpl, clearTimeoutImpl, graceMs) {
+  let cancelResult;
+  try {
+    cancelResult = reader.cancel(reason);
+  } catch {
+    return Promise.resolve();
+  }
+  const settled = Promise.resolve(cancelResult).catch(() => {});
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    const timer = setTimeoutImpl(finish, graceMs);
+    settled.then(() => {
+      clearTimeoutImpl(timer);
+      finish();
+    });
+  });
+}
+
+// Reads the request body while enforcing (a) a hard byte ceiling and (b) a
+// single total deadline for the whole read. Content-Length is checked first
+// (cheap early rejection) but is never trusted on its own: the actual streamed
+// bytes are counted, so a missing or understated length header cannot bypass
+// the limit. The deadline covers the entire read and never restarts per chunk,
+// so a slow client cannot keep a request alive forever. The body is fully
+// buffered: chunks are retained and concatenated once into a single
+// Uint8Array (the chunk list is dropped afterwards), avoiding any text decoding
+// and any duplicate copy for the common single-chunk case. Bytes are preserved
+// exactly.
+export async function readBoundedBody(request, maxBytes, options = {}) {
+  const {
+    timeoutMs = DEFAULT_REQUEST_BODY_TIMEOUT_MS,
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
+    cancelGraceMs = DEFAULT_BODY_CANCEL_GRACE_MS,
+  } = options;
+
   const declared = request.headers.get("content-length");
   if (declared !== null) {
     const declaredBytes = Number(declared);
@@ -198,9 +264,31 @@ export async function readBoundedBody(request, maxBytes) {
   const reader = bodyStream.getReader();
   const chunks = [];
   let total = 0;
-  try {
+  let timer = null;
+
+  // Shared terminal state for the whole body-read operation. Once `stopped` is
+  // set, the read loop must not retain another chunk or initiate another read,
+  // even if a previously-pending reader.read() settles later or the underlying
+  // source ignores cancellation. The deadline callback sets it synchronously,
+  // before the timeout outcome is resolved, so a late read observes it at once.
+  const terminal = { stopped: false };
+
+  // A total-deadline timer, armed once for the entire read. It never restarts
+  // per chunk, so a slow client cannot keep a request alive forever.
+  const deadline = new Promise((resolve) => {
+    timer = setTimeoutImpl(() => {
+      terminal.stopped = true;
+      resolve();
+    }, timeoutMs);
+  });
+
+  const readDone = (async () => {
     for (;;) {
       const { done, value } = await reader.read();
+      // Check the terminal state immediately after every awaited read -- before
+      // inspecting the chunk, updating the byte counter, retaining the chunk, or
+      // issuing another read. This is what stops late processing after timeout.
+      if (terminal.stopped) return;
       if (done) break;
       total += value.byteLength;
       if (total > maxBytes) {
@@ -208,13 +296,35 @@ export async function readBoundedBody(request, maxBytes) {
       }
       chunks.push(value);
     }
-  } catch (readError) {
-    try {
-      await reader.cancel(readError);
-    } catch {}
+  })();
+  // Mark the loop promise handled so a racing timeout or a late rejection can
+  // never surface as an unhandled rejection.
+  readDone.catch(() => {});
+
+  const outcome = await Promise.race([
+    readDone.then(() => ({ kind: "done" })),
+    deadline.then(() => ({ kind: "timeout" })),
+  ]).catch(async (readError) => {
+    // The read loop rejected (oversized body or a source error). Stop the loop,
+    // clear the deadline timer, best-effort cancel, then surface the failure.
+    terminal.stopped = true;
+    clearTimeoutImpl(timer);
+    await cancelReaderBounded(reader, readError, setTimeoutImpl, clearTimeoutImpl, cancelGraceMs);
     throw readError;
+  });
+
+  // The race settled: always clear the deadline timer on this path.
+  clearTimeoutImpl(timer);
+
+  if (outcome.kind === "timeout") {
+    // Best-effort, bounded cancellation; never awaited indefinitely.
+    await cancelReaderBounded(reader, new BodyReadTimeoutError(), setTimeoutImpl, clearTimeoutImpl, cancelGraceMs);
+    throw new BodyReadTimeoutError();
   }
 
+  if (chunks.length === 0) {
+    return new Uint8Array(0);
+  }
   if (chunks.length === 1) {
     return chunks[0];
   }
@@ -469,18 +579,30 @@ export class RateGate extends DurableObject {
       MAX_QUEUE_WAIT_MS: maxQueueWaitMs,
       MAX_QUEUE_DEPTH: maxQueueDepth,
       MAX_BODY_BYTES: maxBodyBytes,
+      REQUEST_BODY_TIMEOUT_MS: requestBodyTimeoutMs,
     } = config;
 
-    // F2: Read request body BEFORE acquiring exclusive queue slot, enforcing a
-    // bounded size limit without trusting Content-Length alone.
+    // F2/F1: Read request body BEFORE acquiring an exclusive queue slot,
+    // enforcing a bounded size limit and a total read deadline without trusting
+    // Content-Length alone.
     let body;
     try {
-      body = await readBoundedBody(request, maxBodyBytes);
+      body = await readBoundedBody(request, maxBodyBytes, {
+        timeoutMs: requestBodyTimeoutMs,
+        setTimeoutImpl: this.setTimeoutImpl,
+        clearTimeoutImpl: this.clearTimeoutImpl,
+      });
     } catch (bodyError) {
       if (bodyError instanceof BodyTooLargeError) {
         return Response.json(
           { error: "Request body too large" },
           { status: 413 }
+        );
+      }
+      if (bodyError instanceof BodyReadTimeoutError) {
+        return Response.json(
+          { error: "Request body read timed out" },
+          { status: 408 }
         );
       }
       if (request.signal?.aborted) {
