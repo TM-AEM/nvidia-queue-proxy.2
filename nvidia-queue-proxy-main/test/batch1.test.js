@@ -29,6 +29,7 @@ const {
   ConfigError,
   readBoundedBody,
   BodyTooLargeError,
+  BodyReadTimeoutError,
 } = await import("../src/index.js");
 
 function createMockCtx() {
@@ -148,6 +149,95 @@ function createControllableUpstream() {
     { highWaterMark: 0 }
   );
   return { stream, state };
+}
+
+// A controllable request-body source for timeout/cancellation tests. Chunks are
+// enqueued only when pushed, and cancel() behavior is configurable so tests can
+// exercise a cooperative or a never-settling cancellation.
+function createControllableBody(options = {}) {
+  const { cancelNeverSettles = false, onCancel = null } = options;
+  const pending = [];
+  const buffered = [];
+  const state = {
+    cancelCalled: false,
+    push(chunk) {
+      if (pending.length > 0) {
+        pending.shift().enqueue(chunk);
+      } else {
+        buffered.push(chunk);
+      }
+    },
+    close() {
+      if (pending.length > 0) {
+        pending.shift().close();
+      } else {
+        buffered.push(null);
+      }
+    },
+    get pendingCount() {
+      return pending.length;
+    },
+  };
+  const stream = new ReadableStream(
+    {
+      pull(controller) {
+        if (buffered.length > 0) {
+          const next = buffered.shift();
+          if (next === null) {
+            controller.close();
+          } else {
+            controller.enqueue(next);
+          }
+        } else {
+          pending.push(controller);
+        }
+      },
+      cancel(reason) {
+        state.cancelCalled = true;
+        if (onCancel) onCancel(reason);
+        if (cancelNeverSettles) {
+          return new Promise(() => {});
+        }
+        return undefined;
+      },
+    },
+    { highWaterMark: 0 }
+  );
+  return { stream, state };
+}
+
+// A manual body source whose reader is fully controlled by the test. Unlike a
+// ReadableStream, cancel() does not close the reader, so a test can resolve a
+// "late" read after a timeout to prove it cannot re-enter the queue.
+function createManualBody() {
+  const reads = [];
+  const state = { cancelled: false };
+  const reader = {
+    read() {
+      return new Promise((resolve) => {
+        reads.push(resolve);
+      });
+    },
+    cancel() {
+      state.cancelled = true;
+      return Promise.resolve();
+    },
+  };
+  return {
+    body: { getReader: () => reader },
+    state,
+    resolveRead(value) {
+      const resolve = reads.shift();
+      if (resolve) resolve({ value, done: false });
+    },
+    closeRead() {
+      const resolve = reads.shift();
+      if (resolve) resolve({ value: undefined, done: true });
+    },
+    get pendingReads() {
+      return reads.length;
+    },
+  };
 }
 
 // ==========================================
@@ -2014,4 +2104,396 @@ test("F3: Invalid runtime configuration fails closed with 500 and no secret leak
   assert.ok(!text.includes("sk-do-not-leak"), "Response must not reveal secrets");
   assert.ok(!text.includes("proxy-secret"), "Response must not reveal secrets");
   assert.equal(rateGate.activeTicket, null, "No queue slot may be acquired on config failure");
+});
+
+// ==========================================
+// BATCH 1G REGRESSION TESTS — Body read timeout, limits, cancellation
+// ==========================================
+
+test("F1: Body completing before the deadline is accepted", async () => {
+  const timers = createFakeTimers();
+  const body = createControllableBody();
+  const fakeRequest = {
+    headers: { get: () => null },
+    body: body.stream,
+  };
+  const promise = readBoundedBody(fakeRequest, 1024, {
+    timeoutMs: 5_000,
+    setTimeoutImpl: (fn, ms) => timers.setTimeout(fn, ms),
+    clearTimeoutImpl: (id) => timers.clearTimeout(id),
+    cancelGraceMs: 1_000,
+  });
+
+  await tick();
+  body.state.push(new Uint8Array([1, 2, 3]));
+  body.state.close();
+
+  const result = await promise;
+  assert.deepEqual(Array.from(result), [1, 2, 3]);
+  assert.equal(timers.pendingCount(), 0, "All timers must be cleared on the success path");
+});
+
+test("F1: A body that stalls until the deadline returns a 408 timeout", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+  const body = createControllableBody();
+  let upstreamCalled = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    REQUEST_BODY_TIMEOUT_MS: 2_000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => {
+      upstreamCalled = true;
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: body.stream,
+    duplex: "half",
+  });
+
+  const resPromise = rateGate.fetch(req);
+  await tick();
+  // The client sends nothing and stalls -> fire the total deadline.
+  timers.advance(2_000);
+
+  const res = await resPromise;
+  assert.equal(res.status, 408, "A stalled body must return 408 Request Timeout");
+  const data = await res.json();
+  assert.equal(data.error, "Request body read timed out");
+  assert.equal(upstreamCalled, false, "No upstream dispatch may occur on a body timeout");
+  assert.equal(rateGate.activeTicket, null, "No queue slot may be acquired on a body timeout");
+  assert.equal(
+    await ctx.storage.get("rate-state"),
+    undefined,
+    "No attempt accounting may occur on a body timeout"
+  );
+});
+
+test("F1: A body that keeps producing chunks but exceeds the total deadline returns 408", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+  const body = createControllableBody();
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    REQUEST_BODY_TIMEOUT_MS: 1_000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: body.stream,
+    duplex: "half",
+  });
+
+  const resPromise = rateGate.fetch(req);
+  await tick();
+  // The client keeps dribbling bytes but never finishes before the deadline.
+  body.state.push(new Uint8Array([1]));
+  await tick();
+  body.state.push(new Uint8Array([2]));
+  await tick();
+  timers.advance(1_000);
+
+  const res = await resPromise;
+  assert.equal(res.status, 408, "The deadline must cover the whole body, not restart per chunk");
+});
+
+test("F1: A timeout that loses the race to a completed body does not dispatch late", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+  const body = createControllableBody();
+  let upstreamCalled = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    REQUEST_BODY_TIMEOUT_MS: 5_000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => {
+      upstreamCalled = true;
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: body.stream,
+    duplex: "half",
+  });
+
+  const resPromise = rateGate.fetch(req);
+  await tick();
+  // Body completes and closes BEFORE the deadline fires.
+  body.state.push(new Uint8Array([9, 9]));
+  body.state.close();
+  const res = await resPromise;
+  assert.equal(res.status, 200, "A body completing before the deadline must be accepted");
+  await res.text();
+  assert.equal(upstreamCalled, true, "The accepted request must dispatch upstream");
+  assert.equal(timers.pendingCount(), 0, "No deadline timer may remain after completion");
+
+  // Advancing past the deadline must not cause any late dispatch or error.
+  timers.advance(10_000);
+  assert.equal(upstreamCalled, true);
+});
+
+test("F3: A timeout does not wait indefinitely for a never-settling reader.cancel()", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+  const body = createControllableBody({ cancelNeverSettles: true });
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    REQUEST_BODY_TIMEOUT_MS: 1_000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: body.stream,
+    duplex: "half",
+  });
+
+  const resPromise = rateGate.fetch(req);
+  await tick();
+  timers.advance(1_000); // total deadline fires
+
+  let settled = false;
+  resPromise.then(() => {
+    settled = true;
+  });
+  await tick();
+  // The 408 response must arrive once the bounded cancel grace elapses, even
+  // though reader.cancel() never settles.
+  assert.equal(settled, false, "Response must not be delivered before the bounded grace elapses");
+  assert.equal(body.state.cancelCalled, true, "Cancellation must be attempted");
+  timers.advance(1_000); // cancel grace fires -> bounded cleanup completes
+
+  const res = await resPromise;
+  assert.equal(res.status, 408, "The 408 must not be blocked by a never-settling cancel()");
+  assert.equal(rateGate.activeTicket, null);
+});
+
+test("F3: A late body read after timeout cannot enter the queue", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+  const manual = createManualBody();
+  let upstreamCalled = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    REQUEST_BODY_TIMEOUT_MS: 1_000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => {
+      upstreamCalled = true;
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = {
+    url: "https://proxy.internal/v1/chat/completions",
+    method: "POST",
+    headers: { get: () => null },
+    signal: undefined,
+    body: manual.body,
+  };
+
+  const resPromise = rateGate.fetch(req);
+  await tick();
+  timers.advance(1_000); // deadline fires -> 408
+  timers.advance(1_000); // bounded cancel grace elapses
+  const res = await resPromise;
+  assert.equal(res.status, 408);
+  assert.equal(manual.state.cancelled, true);
+
+  // Now the stalled upstream read finally resolves with data; the late result
+  // must be discarded and must never reach queue admission or dispatch.
+  manual.resolveRead(new Uint8Array([1, 2, 3]));
+  await tick();
+  await tick();
+  manual.closeRead();
+  await tick();
+  assert.equal(upstreamCalled, false, "A late body read must never enter the queue or dispatch");
+  assert.equal(rateGate.activeTicket, null);
+  assert.equal(await ctx.storage.get("rate-state"), undefined);
+});
+
+test("F2: MAX_BODY_BYTES cannot be configured above the 20 MiB safe cap", () => {
+  assert.equal(resolveConfig({ MAX_BODY_BYTES: 20 * 1024 * 1024 }).MAX_BODY_BYTES, 20 * 1024 * 1024);
+  assert.throws(
+    () => resolveConfig({ MAX_BODY_BYTES: 20 * 1024 * 1024 + 1 }),
+    ConfigError,
+    "Values above the 20 MiB cap must be rejected"
+  );
+  assert.throws(() => resolveConfig({ MAX_BODY_BYTES: "1073741824" }), ConfigError);
+});
+
+test("F2: A body at the exact limit is forwarded byte-for-byte, including binary", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let receivedBody = null;
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 8,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async (url, opts) => {
+      receivedBody = opts.body;
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+  const payload = new Uint8Array([0, 255, 1, 254, 2, 253, 3, 252]);
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: payload,
+    })
+  );
+  assert.equal(res.status, 200);
+  await res.text();
+  assert.deepEqual(
+    Array.from(receivedBody),
+    Array.from(payload),
+    "Binary body must be forwarded byte-identical"
+  );
+});
+
+test("F2: Multi-chunk body is concatenated in order and preserved exactly", async () => {
+  const body = createControllableBody();
+  const fakeRequest = { headers: { get: () => null }, body: body.stream };
+  const promise = readBoundedBody(fakeRequest, 1024);
+  await tick();
+  body.state.push(new Uint8Array([1, 2]));
+  await tick();
+  body.state.push(new Uint8Array([3]));
+  await tick();
+  body.state.push(new Uint8Array([4, 5]));
+  await tick();
+  body.state.close();
+  const result = await promise;
+  assert.deepEqual(Array.from(result), [1, 2, 3, 4, 5]);
+});
+
+test("F3: A rejecting reader.cancel() does not become an unhandled rejection", async () => {
+  const body = createControllableBody({
+    onCancel: () => {
+      throw new Error("cancel rejected");
+    },
+  });
+  const fakeRequest = { headers: { get: () => null }, body: body.stream };
+  const timers = createFakeTimers();
+  const promise = readBoundedBody(fakeRequest, 1024, {
+    timeoutMs: 1_000,
+    setTimeoutImpl: (fn, ms) => timers.setTimeout(fn, ms),
+    clearTimeoutImpl: (id) => timers.clearTimeout(id),
+    cancelGraceMs: 500,
+  });
+  await tick();
+  timers.advance(1_000);
+  timers.advance(500);
+  await assert.rejects(() => promise, BodyReadTimeoutError);
+  // Allow any stray microtasks to run; an unhandled rejection would fail the run.
+  await tick();
+  await tick();
+});
+
+test("F3: Oversized body with a never-settling cancel still returns 413 promptly", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+  const body = createControllableBody({ cancelNeverSettles: true });
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 4,
+    REQUEST_BODY_TIMEOUT_MS: 60_000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: body.stream,
+    duplex: "half",
+  });
+
+  const resPromise = rateGate.fetch(req);
+  await tick();
+  body.state.push(new Uint8Array(10)); // exceeds the limit -> BodyTooLargeError
+  await tick();
+  timers.advance(1_000); // bounded cancel grace
+
+  const res = await resPromise;
+  assert.equal(res.status, 413, "413 must not be blocked by a never-settling cancel()");
+  assert.equal(rateGate.activeTicket, null);
+});
+
+test("F1: REQUEST_BODY_TIMEOUT_MS defaults and bounds are enforced", () => {
+  assert.equal(resolveConfig({}).REQUEST_BODY_TIMEOUT_MS, 30_000);
+  assert.equal(resolveConfig({ REQUEST_BODY_TIMEOUT_MS: "1000" }).REQUEST_BODY_TIMEOUT_MS, 1_000);
+  assert.equal(resolveConfig({ REQUEST_BODY_TIMEOUT_MS: 120_000 }).REQUEST_BODY_TIMEOUT_MS, 120_000);
+  assert.throws(() => resolveConfig({ REQUEST_BODY_TIMEOUT_MS: 999 }), ConfigError);
+  assert.throws(() => resolveConfig({ REQUEST_BODY_TIMEOUT_MS: 120_001 }), ConfigError);
+  assert.throws(() => resolveConfig({ REQUEST_BODY_TIMEOUT_MS: 0 }), ConfigError);
+  assert.throws(() => resolveConfig({ REQUEST_BODY_TIMEOUT_MS: -5 }), ConfigError);
+  assert.throws(() => resolveConfig({ REQUEST_BODY_TIMEOUT_MS: "1500.5" }), ConfigError);
+  assert.throws(() => resolveConfig({ REQUEST_BODY_TIMEOUT_MS: "NaN" }), ConfigError);
+  assert.throws(() => resolveConfig({ REQUEST_BODY_TIMEOUT_MS: "" }), ConfigError);
+  assert.throws(() => resolveConfig({ REQUEST_BODY_TIMEOUT_MS: "   " }), ConfigError);
+  assert.throws(() => resolveConfig({ REQUEST_BODY_TIMEOUT_MS: "Infinity" }), ConfigError);
 });
