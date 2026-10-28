@@ -10,28 +10,17 @@ const DEFAULT_RESPONSE_HEADER_TIMEOUT_MS = 30_000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_QUEUE_WAIT_MS = 60_000;
 const DEFAULT_MAX_QUEUE_DEPTH = 100;
-const DEFAULT_MAX_BODY_BYTES = 20 * 1024 * 1024; // 20 MiB
+const DEFAULT_MAX_BODY_BYTES = 20 * 1024 * 1024;
 const DEFAULT_REQUEST_BODY_TIMEOUT_MS = 30_000;
 
-// Safe upper bounds. Timer-based settings share a 24h ceiling to prevent
-// setTimeout overflow; counters get independent ceilings to bound memory.
 const MAX_TIMEOUT_MS = 86_400_000;
 const MAX_RPM_LIMIT = 100_000;
 const MAX_QUEUE_DEPTH_LIMIT = 100_000;
-// The request body is fully buffered in memory before dispatch, so the
-// configurable ceiling cannot exceed the safe default.
-const MAX_BODY_BYTES_LIMIT = DEFAULT_MAX_BODY_BYTES; // 20 MiB
+const MAX_BODY_BYTES_LIMIT = DEFAULT_MAX_BODY_BYTES;
 const MIN_REQUEST_BODY_TIMEOUT_MS = 1_000;
 const MAX_REQUEST_BODY_TIMEOUT_MS = 120_000;
-// Bounded grace for best-effort body-reader cancellation after a timeout or
-// read failure. This only bounds how long we wait; it never proves the source
-// stopped.
 const DEFAULT_BODY_CANCEL_GRACE_MS = 1_000;
 
-// Single source of truth for every environment setting the Worker reads.
-// `envNames` lists the accepted names in priority order (canonical first,
-// legacy aliases after). `min`/`max` are inclusive bounds. `allowZero` marks
-// settings where an explicit 0 has a deliberate, documented meaning.
 const CONFIG_SPECS = {
   RPM: {
     envNames: ["RPM"],
@@ -107,37 +96,43 @@ export class ConfigError extends Error {
   }
 }
 
-// Strict, deterministic validation. Missing or explicit "null" values fall back
-// to the documented default. Everything else must be a clean, in-range number;
-// ambiguous input (empty/whitespace, NaN, infinities, malformed strings,
-// fractional values for integer-only settings, out-of-range) is rejected
-// rather than silently coerced.
 export function readConfigValue(rawValue, spec, key) {
-  if (rawValue === undefined || rawValue === null || rawValue === "null") {
+  if (
+    rawValue === undefined ||
+    rawValue === null ||
+    rawValue === "null"
+  ) {
     return spec.default;
   }
+
   if (typeof rawValue === "number") {
     return validateConfigNumber(rawValue, spec, key);
   }
+
   if (typeof rawValue === "string") {
     const trimmed = rawValue.trim();
+
     if (trimmed === "") {
       throw new ConfigError(
         key,
         `Invalid configuration for ${key}: empty or whitespace-only value`
       );
     }
-    // Only canonical decimal notation is accepted; exponent, hex, and signed
-    // forms are rejected so parsing stays deterministic across environments.
-    const pattern = spec.integer ? /^-?\d+$/ : /^-?\d+(\.\d+)?$/;
+
+    const pattern = spec.integer
+      ? /^-?\d+$/
+      : /^-?\d+(\.\d+)?$/;
+
     if (!pattern.test(trimmed)) {
       throw new ConfigError(
         key,
         `Invalid configuration for ${key}: not a valid number`
       );
     }
+
     return validateConfigNumber(Number(trimmed), spec, key);
   }
+
   throw new ConfigError(
     key,
     `Invalid configuration for ${key}: unsupported value type`
@@ -151,39 +146,47 @@ function validateConfigNumber(num, spec, key) {
       `Invalid configuration for ${key}: not a finite number`
     );
   }
+
   if (spec.integer && !Number.isInteger(num)) {
     throw new ConfigError(
       key,
       `Invalid configuration for ${key}: must be an integer`
     );
   }
+
   if (num < spec.min || num > spec.max) {
     throw new ConfigError(
       key,
       `Invalid configuration for ${key}: must be between ${spec.min} and ${spec.max}`
     );
   }
+
   if (num === 0 && !spec.allowZero) {
     throw new ConfigError(
       key,
       `Invalid configuration for ${key}: zero is not a supported value`
     );
   }
+
   return num;
 }
 
 export function resolveConfig(env) {
   const resolved = {};
+
   for (const [key, spec] of Object.entries(CONFIG_SPECS)) {
     let rawValue;
+
     for (const name of spec.envNames) {
       if (env?.[name] !== undefined) {
         rawValue = env[name];
         break;
       }
     }
+
     resolved[key] = readConfigValue(rawValue, spec, key);
   }
+
   return resolved;
 }
 
@@ -201,28 +204,34 @@ export class BodyReadTimeoutError extends Error {
   }
 }
 
-// Best-effort cancellation of a body reader. The returned promise settles
-// quickly whether or not the underlying stream honors cancellation: it races
-// the cancel() promise against a bounded grace period. A never-settling
-// cancel() therefore cannot block the response, and any rejection is swallowed
-// so it never becomes an unhandled rejection. Note this only bounds waiting --
-// it cannot prove that an uncooperative source has actually stopped producing.
-function cancelReaderBounded(reader, reason, setTimeoutImpl, clearTimeoutImpl, graceMs) {
+function cancelReaderBounded(
+  reader,
+  reason,
+  setTimeoutImpl,
+  clearTimeoutImpl,
+  graceMs
+) {
   let cancelResult;
+
   try {
     cancelResult = reader.cancel(reason);
   } catch {
     return Promise.resolve();
   }
+
   const settled = Promise.resolve(cancelResult).catch(() => {});
+
   return new Promise((resolve) => {
     let done = false;
+
     const finish = () => {
       if (done) return;
       done = true;
       resolve();
     };
+
     const timer = setTimeoutImpl(finish, graceMs);
+
     settled.then(() => {
       clearTimeoutImpl(timer);
       finish();
@@ -230,17 +239,11 @@ function cancelReaderBounded(reader, reason, setTimeoutImpl, clearTimeoutImpl, g
   });
 }
 
-// Reads the request body while enforcing (a) a hard byte ceiling and (b) a
-// single total deadline for the whole read. Content-Length is checked first
-// (cheap early rejection) but is never trusted on its own: the actual streamed
-// bytes are counted, so a missing or understated length header cannot bypass
-// the limit. The deadline covers the entire read and never restarts per chunk,
-// so a slow client cannot keep a request alive forever. The body is fully
-// buffered: chunks are retained and concatenated once into a single
-// Uint8Array (the chunk list is dropped afterwards), avoiding any text decoding
-// and any duplicate copy for the common single-chunk case. Bytes are preserved
-// exactly.
-export async function readBoundedBody(request, maxBytes, options = {}) {
+export async function readBoundedBody(
+  request,
+  maxBytes,
+  options = {}
+) {
   const {
     timeoutMs = DEFAULT_REQUEST_BODY_TIMEOUT_MS,
     setTimeoutImpl = setTimeout,
@@ -249,14 +252,20 @@ export async function readBoundedBody(request, maxBytes, options = {}) {
   } = options;
 
   const declared = request.headers.get("content-length");
+
   if (declared !== null) {
     const declaredBytes = Number(declared);
-    if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+
+    if (
+      Number.isFinite(declaredBytes) &&
+      declaredBytes > maxBytes
+    ) {
       throw new BodyTooLargeError();
     }
   }
 
   const bodyStream = request.body;
+
   if (!bodyStream) {
     return new Uint8Array(0);
   }
@@ -266,15 +275,8 @@ export async function readBoundedBody(request, maxBytes, options = {}) {
   let total = 0;
   let timer = null;
 
-  // Shared terminal state for the whole body-read operation. Once `stopped` is
-  // set, the read loop must not retain another chunk or initiate another read,
-  // even if a previously-pending reader.read() settles later or the underlying
-  // source ignores cancellation. The deadline callback sets it synchronously,
-  // before the timeout outcome is resolved, so a late read observes it at once.
   const terminal = { stopped: false };
 
-  // A total-deadline timer, armed once for the entire read. It never restarts
-  // per chunk, so a slow client cannot keep a request alive forever.
   const deadline = new Promise((resolve) => {
     timer = setTimeoutImpl(() => {
       terminal.stopped = true;
@@ -285,55 +287,70 @@ export async function readBoundedBody(request, maxBytes, options = {}) {
   const readDone = (async () => {
     for (;;) {
       const { done, value } = await reader.read();
-      // Check the terminal state immediately after every awaited read -- before
-      // inspecting the chunk, updating the byte counter, retaining the chunk, or
-      // issuing another read. This is what stops late processing after timeout.
+
       if (terminal.stopped) return;
       if (done) break;
+
       total += value.byteLength;
+
       if (total > maxBytes) {
         throw new BodyTooLargeError();
       }
+
       chunks.push(value);
     }
   })();
-  // Mark the loop promise handled so a racing timeout or a late rejection can
-  // never surface as an unhandled rejection.
+
   readDone.catch(() => {});
 
   const outcome = await Promise.race([
     readDone.then(() => ({ kind: "done" })),
     deadline.then(() => ({ kind: "timeout" })),
   ]).catch(async (readError) => {
-    // The read loop rejected (oversized body or a source error). Stop the loop,
-    // clear the deadline timer, best-effort cancel, then surface the failure.
     terminal.stopped = true;
     clearTimeoutImpl(timer);
-    await cancelReaderBounded(reader, readError, setTimeoutImpl, clearTimeoutImpl, cancelGraceMs);
+
+    await cancelReaderBounded(
+      reader,
+      readError,
+      setTimeoutImpl,
+      clearTimeoutImpl,
+      cancelGraceMs
+    );
+
     throw readError;
   });
 
-  // The race settled: always clear the deadline timer on this path.
   clearTimeoutImpl(timer);
 
   if (outcome.kind === "timeout") {
-    // Best-effort, bounded cancellation; never awaited indefinitely.
-    await cancelReaderBounded(reader, new BodyReadTimeoutError(), setTimeoutImpl, clearTimeoutImpl, cancelGraceMs);
+    await cancelReaderBounded(
+      reader,
+      new BodyReadTimeoutError(),
+      setTimeoutImpl,
+      clearTimeoutImpl,
+      cancelGraceMs
+    );
+
     throw new BodyReadTimeoutError();
   }
 
   if (chunks.length === 0) {
     return new Uint8Array(0);
   }
+
   if (chunks.length === 1) {
     return chunks[0];
   }
+
   const combined = new Uint8Array(total);
   let offset = 0;
+
   for (const chunk of chunks) {
     combined.set(chunk, offset);
     offset += chunk.byteLength;
   }
+
   return combined;
 }
 
@@ -342,14 +359,20 @@ export function sleep(ms, signal) {
     if (signal?.aborted) {
       return reject(signal.reason || new Error("Aborted"));
     }
+
     const timer = setTimeout(() => {
-      if (signal) signal.removeEventListener("abort", onAbort);
+      if (signal) {
+        signal.removeEventListener("abort", onAbort);
+      }
+
       resolve();
     }, ms);
+
     const onAbort = () => {
       clearTimeout(timer);
       reject(signal.reason || new Error("Aborted"));
     };
+
     if (signal) {
       signal.addEventListener("abort", onAbort, { once: true });
     }
@@ -358,34 +381,55 @@ export function sleep(ms, signal) {
 
 export function retryAfterMs(response, now = Date.now()) {
   const value = response?.headers?.get("Retry-After");
+
   if (!value) return 0;
+
   const trimmed = value.trim();
   const seconds = Number(trimmed);
+
   if (!Number.isNaN(seconds)) {
     return seconds > 0 ? Math.round(seconds * 1000) : 0;
   }
+
   const date = Date.parse(trimmed);
-  return Number.isFinite(date) ? Math.max(0, date - now) : 0;
+
+  return Number.isFinite(date)
+    ? Math.max(0, date - now)
+    : 0;
 }
 
-export function computeBackoffDelay(retryIndex, response, options = {}) {
+export function computeBackoffDelay(
+  retryIndex,
+  response,
+  options = {}
+) {
   const {
     now = Date.now(),
     maxBackoffMs = MAX_BACKOFF_MS,
     baseDelayMs = 1000,
     jitterFn = null,
   } = options;
+
   const expDelay = baseDelayMs * (2 ** retryIndex);
-  const retryAfter = response ? retryAfterMs(response, now) : 0;
-  const delay = Math.min(maxBackoffMs, Math.max(expDelay, retryAfter));
+  const retryAfter = response
+    ? retryAfterMs(response, now)
+    : 0;
+
+  const delay = Math.min(
+    maxBackoffMs,
+    Math.max(expDelay, retryAfter)
+  );
+
   if (typeof jitterFn === "function") {
     return jitterFn(delay);
   }
+
   return delay;
 }
 
 export function safeResponseHeaders(headers) {
   const result = new Headers(headers);
+
   for (const name of [
     "connection",
     "keep-alive",
@@ -399,26 +443,53 @@ export function safeResponseHeaders(headers) {
   ]) {
     result.delete(name);
   }
+
   return result;
 }
 
 export class RateGate extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
+
     this.waitingQueue = [];
     this.activeTicket = null;
-    this.now = typeof env?.__now === "function" ? env.__now : () => Date.now();
+
+    this.now =
+      typeof env?.__now === "function"
+        ? env.__now
+        : () => Date.now();
+
     this.getNow = () => this.now();
+
     this.sleepImpl =
-      typeof env?.__sleep === "function" ? env.__sleep : sleep;
+      typeof env?.__sleep === "function"
+        ? env.__sleep
+        : sleep;
+
     this.getSleepImpl = () => this.sleepImpl || sleep;
+
     this.fetchImpl =
-      typeof env?.__fetch === "function" ? env.__fetch : fetch;
-    this.getFetchImpl = () => this.fetchImpl || (typeof this.env?.__fetch === "function" ? this.env.__fetch : fetch);
+      typeof env?.__fetch === "function"
+        ? env.__fetch
+        : fetch;
+
+    this.getFetchImpl = () =>
+      this.fetchImpl ||
+      (
+        typeof this.env?.__fetch === "function"
+          ? this.env.__fetch
+          : fetch
+      );
+
     this.setTimeoutImpl =
-      typeof env?.__setTimeout === "function" ? env.__setTimeout : setTimeout;
+      typeof env?.__setTimeout === "function"
+        ? env.__setTimeout
+        : setTimeout;
+
     this.clearTimeoutImpl =
-      typeof env?.__clearTimeout === "function" ? env.__clearTimeout : clearTimeout;
+      typeof env?.__clearTimeout === "function"
+        ? env.__clearTimeout
+        : clearTimeout;
   }
 
   cleanTicket(ticket) {
@@ -426,14 +497,20 @@ export class RateGate extends DurableObject {
       clearTimeout(ticket.timer);
       ticket.timer = null;
     }
+
     if (ticket.abortHandler && ticket.request?.signal) {
-      ticket.request.signal.removeEventListener("abort", ticket.abortHandler);
+      ticket.request.signal.removeEventListener(
+        "abort",
+        ticket.abortHandler
+      );
+
       ticket.abortHandler = null;
     }
   }
 
   removeFromWaitingQueue(ticket) {
     const index = this.waitingQueue.indexOf(ticket);
+
     if (index !== -1) {
       this.waitingQueue.splice(index, 1);
     }
@@ -441,15 +518,19 @@ export class RateGate extends DurableObject {
 
   releaseSlot() {
     this.activeTicket = null;
+
     while (this.waitingQueue.length > 0) {
       const nextTicket = this.waitingQueue.shift();
+
       if (nextTicket.settled) {
         continue;
       }
+
       nextTicket.settled = true;
       this.cleanTicket(nextTicket);
       this.activeTicket = nextTicket;
       nextTicket.resolve(nextTicket);
+
       return;
     }
   }
@@ -462,11 +543,14 @@ export class RateGate extends DurableObject {
         timer: null,
         abortHandler: null,
       };
+
       this.activeTicket = ticket;
+
       return ticket;
     }
 
     let ticketResolve;
+
     const ticketPromise = new Promise((resolve) => {
       ticketResolve = resolve;
     });
@@ -481,10 +565,16 @@ export class RateGate extends DurableObject {
 
     ticket.timer = setTimeout(() => {
       if (ticket.settled) return;
+
       ticket.settled = true;
       this.removeFromWaitingQueue(ticket);
       this.cleanTicket(ticket);
-      const retryAfterSec = Math.max(1, Math.ceil(cooldownMs / 1000));
+
+      const retryAfterSec = Math.max(
+        1,
+        Math.ceil(cooldownMs / 1000)
+      );
+
       ticket.resolve({
         rejectedResponse: Response.json(
           { error: "Maximum queue wait exceeded" },
@@ -502,6 +592,7 @@ export class RateGate extends DurableObject {
       if (request.signal.aborted) {
         this.cleanTicket(ticket);
         ticket.settled = true;
+
         return {
           rejectedResponse: Response.json(
             { error: "Client cancelled" },
@@ -509,11 +600,14 @@ export class RateGate extends DurableObject {
           ),
         };
       }
+
       ticket.abortHandler = () => {
         if (ticket.settled) return;
+
         ticket.settled = true;
         this.removeFromWaitingQueue(ticket);
         this.cleanTicket(ticket);
+
         ticket.resolve({
           rejectedResponse: Response.json(
             { error: "Client cancelled" },
@@ -521,12 +615,16 @@ export class RateGate extends DurableObject {
           ),
         });
       };
-      request.signal.addEventListener("abort", ticket.abortHandler, {
-        once: true,
-      });
+
+      request.signal.addEventListener(
+        "abort",
+        ticket.abortHandler,
+        { once: true }
+      );
     }
 
     this.waitingQueue.push(ticket);
+
     return await ticketPromise;
   }
 
@@ -535,42 +633,70 @@ export class RateGate extends DurableObject {
       if (signal?.aborted) {
         throw signal.reason || new Error("Aborted");
       }
+
       const now = this.now();
-      state.starts = state.starts.filter((time) => now - time < WINDOW_MS);
+
+      state.starts = state.starts.filter(
+        (time) => now - time < WINDOW_MS
+      );
+
       let wait = 0;
+
       if (state.starts.length >= rpm) {
-        const oldestNeeded = state.starts[state.starts.length - rpm];
-        wait = Math.max(wait, oldestNeeded + WINDOW_MS - now);
+        const oldestNeeded =
+          state.starts[state.starts.length - rpm];
+
+        wait = Math.max(
+          wait,
+          oldestNeeded + WINDOW_MS - now
+        );
       }
+
       if (state.lastCompletionAt) {
-        wait = Math.max(wait, state.lastCompletionAt + cooldownMs - now);
+        wait = Math.max(
+          wait,
+          state.lastCompletionAt + cooldownMs - now
+        );
       }
+
       if (state.lastSendAt) {
-        wait = Math.max(wait, state.lastSendAt + cooldownMs - now);
+        wait = Math.max(
+          wait,
+          state.lastSendAt + cooldownMs - now
+        );
       }
+
       if (wait <= 0) return;
+
       await this.sleepImpl(wait, signal);
     }
   }
 
   async fetch(request) {
     const url = new URL(request.url);
-    if (request.method !== "POST" || !url.pathname.startsWith("/v1/")) {
+
+    if (
+      request.method !== "POST" ||
+      !url.pathname.startsWith("/v1/")
+    ) {
       return new Response("Not found", { status: 404 });
     }
 
-    // F3: Strict, fail-closed configuration parsing. Invalid configuration
-    // rejects the request rather than running with a silently coerced value.
     let config;
+
     try {
       config = resolveConfig(this.env);
     } catch (configError) {
-      if (!(configError instanceof ConfigError)) throw configError;
+      if (!(configError instanceof ConfigError)) {
+        throw configError;
+      }
+
       return Response.json(
         { error: "Server configuration error" },
         { status: 500 }
       );
     }
+
     const {
       RPM: rpm,
       COOLDOWN_MS: cooldownMs,
@@ -582,16 +708,18 @@ export class RateGate extends DurableObject {
       REQUEST_BODY_TIMEOUT_MS: requestBodyTimeoutMs,
     } = config;
 
-    // F2/F1: Read request body BEFORE acquiring an exclusive queue slot,
-    // enforcing a bounded size limit and a total read deadline without trusting
-    // Content-Length alone.
     let body;
+
     try {
-      body = await readBoundedBody(request, maxBodyBytes, {
-        timeoutMs: requestBodyTimeoutMs,
-        setTimeoutImpl: this.setTimeoutImpl,
-        clearTimeoutImpl: this.clearTimeoutImpl,
-      });
+      body = await readBoundedBody(
+        request,
+        maxBodyBytes,
+        {
+          timeoutMs: requestBodyTimeoutMs,
+          setTimeoutImpl: this.setTimeoutImpl,
+          clearTimeoutImpl: this.clearTimeoutImpl,
+        }
+      );
     } catch (bodyError) {
       if (bodyError instanceof BodyTooLargeError) {
         return Response.json(
@@ -599,15 +727,21 @@ export class RateGate extends DurableObject {
           { status: 413 }
         );
       }
+
       if (bodyError instanceof BodyReadTimeoutError) {
         return Response.json(
           { error: "Request body read timed out" },
           { status: 408 }
         );
       }
+
       if (request.signal?.aborted) {
-        return Response.json({ error: "Client cancelled" }, { status: 499 });
+        return Response.json(
+          { error: "Client cancelled" },
+          { status: 499 }
+        );
       }
+
       return Response.json(
         { error: "Failed to read request body" },
         { status: 400 }
@@ -615,13 +749,21 @@ export class RateGate extends DurableObject {
     }
 
     if (request.signal?.aborted) {
-      return Response.json({ error: "Client cancelled" }, { status: 499 });
+      return Response.json(
+        { error: "Client cancelled" },
+        { status: 499 }
+      );
     }
 
-    // F4: Queue depth rejection
-    // If an active request is running and waiting backlog has reached capacity:
-    if (this.activeTicket && this.waitingQueue.length >= maxQueueDepth) {
-      const retryAfterSec = Math.max(1, Math.ceil(cooldownMs / 1000));
+    if (
+      this.activeTicket &&
+      this.waitingQueue.length >= maxQueueDepth
+    ) {
+      const retryAfterSec = Math.max(
+        1,
+        Math.ceil(cooldownMs / 1000)
+      );
+
       return Response.json(
         { error: "Queue depth exceeded" },
         {
@@ -633,46 +775,57 @@ export class RateGate extends DurableObject {
       );
     }
 
-    // Acquire queue slot
     const ticket = await this.acquireSlot(
       request,
       maxQueueWaitMs,
       cooldownMs
     );
+
     if (ticket.rejectedResponse) {
       return ticket.rejectedResponse;
     }
 
-    // Client may have aborted while slot was being acquired
     if (request.signal?.aborted) {
       this.releaseSlot();
-      return Response.json({ error: "Client cancelled" }, { status: 499 });
+
+      return Response.json(
+        { error: "Client cancelled" },
+        { status: 499 }
+      );
     }
 
     const upstreamAbortController = new AbortController();
+
     const onClientAbort = () => {
       upstreamAbortController.abort(
-        request.signal?.reason || new Error("Client cancelled")
+        request.signal?.reason ||
+        new Error("Client cancelled")
       );
     };
+
     if (request.signal) {
-      request.signal.addEventListener("abort", onClientAbort, { once: true });
+      request.signal.addEventListener(
+        "abort",
+        onClientAbort,
+        { once: true }
+      );
     }
 
     try {
-      const state = (await this.ctx.storage.get("rate-state")) || {
-        starts: [],
-        lastSendAt: 0,
-        lastCompletionAt: 0,
-      };
+      const state =
+        (await this.ctx.storage.get("rate-state")) || {
+          starts: [],
+          lastSendAt: 0,
+          lastCompletionAt: 0,
+        };
 
       let upstreamResponse;
+
       for (let retry = 0; ; retry++) {
         if (request.signal?.aborted) {
           throw new Error("Client cancelled");
         }
 
-        // Wait for RPM slot and cooldown
         await this.waitForSlot(
           state,
           rpm,
@@ -680,78 +833,107 @@ export class RateGate extends DurableObject {
           upstreamAbortController.signal
         );
 
-        // T1: Count every attempt immediately before dispatching upstream
         const attemptTime = this.now();
+
         state.starts = state.starts.filter(
           (time) => attemptTime - time < WINDOW_MS
         );
+
         state.starts.push(attemptTime);
         state.lastSendAt = attemptTime;
+
         await this.ctx.storage.put("rate-state", state);
 
         const upstreamUrl = new URL(
           url.pathname + url.search,
           NVIDIA_API
         );
+
         const headers = new Headers(request.headers);
+
         headers.set(
           "Authorization",
           `Bearer ${this.env.NVIDIA_API_KEY}`
         );
+
         headers.delete("host");
         headers.delete("x-proxy-key");
         headers.delete("content-length");
 
-        // Response header timeout
         let headerTimeoutId = null;
         let headerTimedOut = false;
+
         headerTimeoutId = setTimeout(() => {
           headerTimedOut = true;
+
           upstreamAbortController.abort(
             new Error("Upstream response header timeout")
           );
         }, responseHeaderTimeoutMs);
 
         try {
-          upstreamResponse = await this.fetchImpl(upstreamUrl, {
-            method: "POST",
-            headers,
-            body,
-            redirect: "manual",
-            signal: upstreamAbortController.signal,
-          });
+          upstreamResponse = await this.fetchImpl(
+            upstreamUrl,
+            {
+              method: "POST",
+              headers,
+              body,
+              redirect: "manual",
+              signal: upstreamAbortController.signal,
+            }
+          );
         } catch (fetchError) {
           if (headerTimeoutId !== null) {
             clearTimeout(headerTimeoutId);
             headerTimeoutId = null;
           }
+
           state.lastCompletionAt = this.now();
+
           await this.ctx.storage.put("rate-state", state);
 
           if (headerTimedOut) {
             if (request.signal) {
-              request.signal.removeEventListener("abort", onClientAbort);
+              request.signal.removeEventListener(
+                "abort",
+                onClientAbort
+              );
             }
+
             this.releaseSlot();
-            const retryAfterSec = Math.max(1, Math.ceil(cooldownMs / 1000));
+
+            const retryAfterSec = Math.max(
+              1,
+              Math.ceil(cooldownMs / 1000)
+            );
+
             return Response.json(
               { error: "Upstream response header timeout" },
               {
                 status: 504,
-                headers: { "Retry-After": String(retryAfterSec) },
+                headers: {
+                  "Retry-After": String(retryAfterSec),
+                },
               }
             );
           }
+
           if (request.signal?.aborted) {
             if (request.signal) {
-              request.signal.removeEventListener("abort", onClientAbort);
+              request.signal.removeEventListener(
+                "abort",
+                onClientAbort
+              );
             }
+
             this.releaseSlot();
+
             return Response.json(
               { error: "Client cancelled" },
               { status: 499 }
             );
           }
+
           throw fetchError;
         }
 
@@ -760,47 +942,69 @@ export class RateGate extends DurableObject {
           headerTimeoutId = null;
         }
 
-        // If not 429, break out of retry loop
         if (upstreamResponse.status !== 429) {
           break;
         }
 
-        // T2: Handle 429 retry
         const retryBody = await upstreamResponse.arrayBuffer();
-        const retryHeaders = safeResponseHeaders(upstreamResponse.headers);
+
+        const retryHeaders = safeResponseHeaders(
+          upstreamResponse.headers
+        );
+
         state.lastCompletionAt = this.now();
+
         await this.ctx.storage.put("rate-state", state);
 
         if (retry >= MAX_429_RETRIES) {
-          // Retries exhausted
           this.releaseSlot();
+
           if (request.signal) {
-            request.signal.removeEventListener("abort", onClientAbort);
+            request.signal.removeEventListener(
+              "abort",
+              onClientAbort
+            );
           }
+
           return new Response(retryBody, {
             status: 429,
             headers: retryHeaders,
           });
         }
 
-        const retryDelay = computeBackoffDelay(retry, upstreamResponse, {
-          now: this.now(),
-          maxBackoffMs: MAX_BACKOFF_MS,
-        });
+        const retryDelay = computeBackoffDelay(
+          retry,
+          upstreamResponse,
+          {
+            now: this.now(),
+            maxBackoffMs: MAX_BACKOFF_MS,
+          }
+        );
 
-        await this.sleepImpl(retryDelay, upstreamAbortController.signal);
+        await this.sleepImpl(
+          retryDelay,
+          upstreamAbortController.signal
+        );
       }
 
-      // Safe response headers
-      const responseHeaders = safeResponseHeaders(upstreamResponse.headers);
+      const responseHeaders = safeResponseHeaders(
+        upstreamResponse.headers
+      );
 
       if (!upstreamResponse.body) {
         state.lastCompletionAt = this.now();
+
         await this.ctx.storage.put("rate-state", state);
+
         if (request.signal) {
-          request.signal.removeEventListener("abort", onClientAbort);
+          request.signal.removeEventListener(
+            "abort",
+            onClientAbort
+          );
         }
+
         this.releaseSlot();
+
         return new Response(null, {
           status: upstreamResponse.status,
           statusText: upstreamResponse.statusText,
@@ -808,17 +1012,18 @@ export class RateGate extends DurableObject {
         });
       }
 
-      // Streaming response with idle timeout and slot holding
       const reader = upstreamResponse.body.getReader();
+
       let released = false;
       let idleTimer = null;
       let idleTimedOut = false;
       let controllerRef = null;
-
       let cancelPromise = null;
+
       const cancelUpstream = (reason) => {
         if (!cancelPromise) {
           let resolveCancel;
+
           cancelPromise = new Promise((resolve) => {
             resolveCancel = resolve;
           });
@@ -831,28 +1036,43 @@ export class RateGate extends DurableObject {
             try {
               await reader.cancel(reason);
             } catch {}
+
             resolveCancel();
           })();
         }
+
         return cancelPromise;
       };
 
       let onAbortStream = null;
+
       const finish = async () => {
         if (cancelPromise) {
           await cancelPromise;
         }
+
         if (released) return;
+
         released = true;
         clearIdleTimer();
+
         if (onAbortStream) {
-          upstreamAbortController.signal.removeEventListener("abort", onAbortStream);
+          upstreamAbortController.signal.removeEventListener(
+            "abort",
+            onAbortStream
+          );
         }
+
         if (request.signal) {
-          request.signal.removeEventListener("abort", onClientAbort);
+          request.signal.removeEventListener(
+            "abort",
+            onClientAbort
+          );
         }
+
         try {
           state.lastCompletionAt = this.getNow();
+
           await this.ctx.storage.put("rate-state", state);
         } finally {
           this.upstreamInFlight = false;
@@ -867,21 +1087,24 @@ export class RateGate extends DurableObject {
         }
       };
 
-      // The idle timer measures upstream read inactivity ONLY. It is armed when
-      // we start waiting for the next upstream read and disarmed the instant
-      // that read settles, before any downstream delivery work. A downstream
-      // consumer that pauses between chunks therefore never trips the timeout.
       const armIdleTimer = () => {
         clearIdleTimer();
+
         if (released || idleTimedOut) return;
+
         idleTimer = this.setTimeoutImpl(async () => {
           idleTimer = null;
+
           if (released || idleTimedOut) return;
+
           idleTimedOut = true;
+
           const timeoutErr = new Error("Stream idle timeout");
+
           try {
             controllerRef?.error(timeoutErr);
           } catch {}
+
           await cancelUpstream(timeoutErr);
           await finish();
         }, streamIdleTimeoutMs);
@@ -889,57 +1112,81 @@ export class RateGate extends DurableObject {
 
       onAbortStream = async () => {
         if (released) return;
+
         clearIdleTimer();
-        await cancelUpstream(upstreamAbortController.signal.reason);
+
+        await cancelUpstream(
+          upstreamAbortController.signal.reason
+        );
+
         try {
-          controllerRef?.error(upstreamAbortController.signal.reason);
+          controllerRef?.error(
+            upstreamAbortController.signal.reason
+          );
         } catch {}
+
         await finish();
       };
-      upstreamAbortController.signal.addEventListener("abort", onAbortStream, { once: true });
 
-      // highWaterMark 0 means the proxy only reads upstream when the downstream
-      // consumer actually demands a chunk: no read-ahead. Combined with arming
-      // the idle timer around reader.read(), this guarantees the timer measures
-      // upstream read inactivity only and never fires for a paused consumer.
+      upstreamAbortController.signal.addEventListener(
+        "abort",
+        onAbortStream,
+        { once: true }
+      );
+
       const stream = new ReadableStream(
         {
           start(controller) {
             controllerRef = controller;
           },
+
           async pull(controller) {
             armIdleTimer();
+
             let result;
+
             try {
               result = await reader.read();
             } catch (readError) {
               clearIdleTimer();
-              if (idleTimedOut || released || upstreamAbortController.signal.aborted) {
+
+              if (
+                idleTimedOut ||
+                released ||
+                upstreamAbortController.signal.aborted
+              ) {
                 return;
               }
+
               try {
                 controller.error(readError);
               } catch {}
+
               await cancelUpstream(readError);
               await finish();
+
               return;
             }
-            // The upstream read settled: disarm immediately, before waiting on
-            // downstream demand or performing any delivery work.
+
             clearIdleTimer();
+
             if (idleTimedOut || released) return;
+
             if (result.done) {
               if (cancelPromise) {
                 await cancelPromise;
               }
+
               controller.close();
               await finish();
             } else {
               controller.enqueue(result.value);
             }
           },
+
           async cancel(reason) {
             clearIdleTimer();
+
             await cancelUpstream(reason);
             await finish();
           },
@@ -954,12 +1201,27 @@ export class RateGate extends DurableObject {
       });
     } catch (error) {
       if (request.signal) {
-        request.signal.removeEventListener("abort", onClientAbort);
+        request.signal.removeEventListener(
+          "abort",
+          onClientAbort
+        );
       }
+
       this.releaseSlot();
+
       if (request.signal?.aborted) {
-        return Response.json({ error: "Client cancelled" }, { status: 499 });
+        return Response.json(
+          { error: "Client cancelled" },
+          { status: 499 }
+        );
       }
+
+      // Diagnostic logging: never log API keys, headers, or request bodies.
+      console.error("Proxy upstream request failed", {
+        name: String(error?.name || "Error").slice(0, 100),
+        message: String(error?.message || error).slice(0, 500),
+      });
+
       return Response.json(
         { error: "Proxy upstream request failed" },
         { status: 502 }
@@ -971,7 +1233,11 @@ export class RateGate extends DurableObject {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === "/health" && request.method === "GET") {
+
+    if (
+      url.pathname === "/health" &&
+      request.method === "GET"
+    ) {
       return Response.json({ ok: true });
     }
 
@@ -981,7 +1247,9 @@ export default {
       });
     }
 
-    const authorization = request.headers.get("Authorization") || "";
+    const authorization =
+      request.headers.get("Authorization") || "";
+
     const suppliedKey = authorization.startsWith("Bearer ")
       ? authorization.slice(7)
       : request.headers.get("x-proxy-key") || "";
@@ -990,11 +1258,17 @@ export default {
       return new Response("Unauthorized", { status: 401 });
     }
 
-    if (request.method !== "POST" || !url.pathname.startsWith("/v1/")) {
+    if (
+      request.method !== "POST" ||
+      !url.pathname.startsWith("/v1/")
+    ) {
       return new Response("Not found", { status: 404 });
     }
 
-    const id = env.RATE_GATE.idFromName("nvidia-global-queue");
+    const id = env.RATE_GATE.idFromName(
+      "nvidia-global-queue"
+    );
+
     return env.RATE_GATE.get(id).fetch(request);
   },
 };
