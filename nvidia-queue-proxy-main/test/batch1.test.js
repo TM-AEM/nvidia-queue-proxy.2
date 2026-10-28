@@ -24,6 +24,11 @@ const {
   retryAfterMs,
   computeBackoffDelay,
   safeResponseHeaders,
+  readConfigValue,
+  resolveConfig,
+  ConfigError,
+  readBoundedBody,
+  BodyTooLargeError,
 } = await import("../src/index.js");
 
 function createMockCtx() {
@@ -66,6 +71,83 @@ class FakeClock {
       resolve();
     });
   }
+}
+
+// Deterministic virtual timer. Only timers created through these functions are
+// tracked; they fire exclusively when advance() is called, so tests never rely
+// on real wall-clock sleeps. This isolates the stream idle timer from the
+// queue-wait and header timers, which continue to use the real event loop.
+function createFakeTimers() {
+  let now = 0;
+  let seq = 0;
+  const timers = new Map();
+  return {
+    setTimeout(fn, ms) {
+      const id = ++seq;
+      timers.set(id, { fn, at: now + ms });
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+    advance(ms) {
+      now += ms;
+      for (const [id, timer] of [...timers]) {
+        if (timer.at <= now) {
+          timers.delete(id);
+          timer.fn();
+        }
+      }
+    },
+    pendingCount() {
+      return timers.size;
+    },
+  };
+}
+
+function tick() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+// A controllable upstream: chunks are enqueued only when pushed, so tests can
+// choose between a ready upstream (no timeout) and a stalled upstream (timeout)
+// with full determinism.
+function createControllableUpstream() {
+  const pending = [];
+  const buffered = [];
+  let cancelled = false;
+  const state = {
+    cancelled: false,
+    push(chunk) {
+      if (pending.length > 0) {
+        pending.shift().enqueue(chunk);
+      } else {
+        buffered.push(chunk);
+      }
+    },
+    get cancelled() {
+      return cancelled;
+    },
+    get pendingCount() {
+      return pending.length;
+    },
+  };
+  const stream = new ReadableStream(
+    {
+      pull(controller) {
+        if (buffered.length > 0) {
+          controller.enqueue(buffered.shift());
+        } else {
+          pending.push(controller);
+        }
+      },
+      cancel() {
+        cancelled = true;
+      },
+    },
+    { highWaterMark: 0 }
+  );
+  return { stream, state };
 }
 
 // ==========================================
@@ -873,11 +955,12 @@ test("T1/T3: Strict FIFO ordering under concurrent requests", async () => {
 // BATCH 1F REGRESSION TESTS (F1 - F5)
 // ==========================================
 
-test("F1: Stream idle timeout triggers when client pauses reading between chunks", async () => {
+test("F1: Stalled upstream read times out and follows slot-safe cancellation", async () => {
   const clock = new FakeClock(0);
   const ctx = createMockCtx();
-  let upstreamReaderCancelled = false;
-  let chunkCount = 0;
+  const timers = createFakeTimers();
+  const upstream = createControllableUpstream();
+  let upstreamSignalAborted = false;
 
   const env = {
     RPM: 10,
@@ -886,17 +969,13 @@ test("F1: Stream idle timeout triggers when client pauses reading between chunks
     NVIDIA_API_KEY: "test-key",
     __now: () => clock.now(),
     __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
     __fetch: async (url, opts) => {
-      const stream = new ReadableStream({
-        pull(controller) {
-          chunkCount++;
-          controller.enqueue(new TextEncoder().encode(`chunk-${chunkCount}`));
-        },
-        cancel() {
-          upstreamReaderCancelled = true;
-        },
+      opts.signal.addEventListener("abort", () => {
+        upstreamSignalAborted = true;
       });
-      return new Response(stream, { status: 200 });
+      return new Response(upstream.stream, { status: 200 });
     },
   };
 
@@ -907,30 +986,36 @@ test("F1: Stream idle timeout triggers when client pauses reading between chunks
       body: "{}",
     })
   );
-
   assert.equal(res1.status, 200);
+
   const reader = res1.body.getReader();
+  // First upstream chunk arrives.
+  upstream.state.push(new TextEncoder().encode("chunk-1"));
+  const first = await reader.read();
+  assert.equal(new TextDecoder().decode(first.value), "chunk-1");
 
-  // Read first chunk successfully
-  const chunk1 = await reader.read();
-  assert.equal(new TextDecoder().decode(chunk1.value), "chunk-1");
+  // No read-ahead while the consumer is idle.
+  await tick();
+  assert.equal(upstream.state.pendingCount, 0, "Proxy must not read ahead while idle");
+  assert.equal(timers.pendingCount(), 0, "No idle timer while no upstream read is pending");
 
-  // Client deliberately pauses and does not read next chunk.
-  // Wait for stream idle timeout (40ms) + margin
-  await new Promise((r) => setTimeout(r, 60));
+  // The consumer asks for the next chunk; the upstream stalls forever.
+  const pendingRead = reader.read();
+  await tick();
+  assert.equal(upstream.state.pendingCount, 1, "Upstream read must be pending");
+  assert.equal(timers.pendingCount(), 1, "Idle timer must be armed while upstream read is pending");
 
-  // Upstream reader must have been cancelled
-  assert.ok(upstreamReaderCancelled, "Upstream reader must be cancelled when client pauses between chunks");
+  // Fire the idle timeout.
+  timers.advance(40);
 
-  // Subsequent read on the consumer side must reject with stream idle timeout
   await assert.rejects(
-    async () => {
-      await reader.read();
-    },
+    () => pendingRead,
     (err) => err.message.includes("Stream idle timeout")
   );
+  assert.equal(upstream.state.cancelled, true, "Upstream stream must be cancelled on idle timeout");
+  assert.equal(upstreamSignalAborted, true, "Upstream fetch signal must be aborted on idle timeout");
 
-  // Next queued request must be able to execute without deadlock
+  // Queue slot must be released so the next request can run without deadlock.
   rateGate.fetchImpl = async () => new Response("unblocked", { status: 200 });
   const res2 = await rateGate.fetch(
     new Request("https://proxy.internal/v1/chat/completions", {
@@ -940,6 +1025,67 @@ test("F1: Stream idle timeout triggers when client pauses reading between chunks
   );
   assert.equal(res2.status, 200);
   assert.equal(await res2.text(), "unblocked");
+});
+
+test("F1: Paused downstream consumer does not trigger the idle timeout", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+  const upstream = createControllableUpstream();
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    STREAM_IDLE_TIMEOUT_MS: 40,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => new Response(upstream.stream, { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res1 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+  assert.equal(res1.status, 200);
+
+  const reader = res1.body.getReader();
+  // Upstream delivers the first chunk and the downstream consumes it.
+  upstream.state.push(new TextEncoder().encode("chunk-1"));
+  const first = await reader.read();
+  assert.equal(new TextDecoder().decode(first.value), "chunk-1");
+
+  // The downstream now pauses. The upstream has nothing more ready and is
+  // therefore stalled, but the proxy must not arm the idle timer until the
+  // consumer actually requests the next chunk.
+  await tick();
+  assert.equal(timers.pendingCount(), 0, "No idle timer may run while downstream is paused");
+  assert.equal(upstream.state.pendingCount, 0, "Proxy must not read ahead while downstream is paused");
+
+  // Pausing longer than the idle timeout must not cancel the stream.
+  timers.advance(1_000);
+  await tick();
+  assert.equal(upstream.state.cancelled, false, "Paused downstream must not cancel the stream");
+  assert.equal(timers.pendingCount(), 0);
+
+  // Only when the consumer resumes does the timer arm for the next upstream read.
+  const pendingRead = reader.read();
+  await tick();
+  assert.equal(upstream.state.pendingCount, 1, "Resuming must issue the next upstream read");
+  assert.equal(timers.pendingCount(), 1, "Timer must be armed while the resumed read is pending");
+
+  // A genuinely stalled upstream still times out after the consumer resumes.
+  timers.advance(40);
+  await assert.rejects(
+    () => pendingRead,
+    (err) => err.message.includes("Stream idle timeout")
+  );
+  assert.equal(upstream.state.cancelled, true, "Stalled upstream must still time out after resume");
 });
 
 test("F2: Delayed incoming request body read does not hold exclusive queue slot", async () => {
@@ -1401,4 +1547,471 @@ test("F5: Client request.signal abort during active streaming propagates upstrea
   );
   assert.equal(res2.status, 200);
   assert.equal(await res2.text(), "ok-2");
+});
+
+
+// ==========================================
+// F2 REGRESSION TESTS — Bounded request bodies
+// ==========================================
+
+function bytes(...values) {
+  return new Uint8Array(values);
+}
+
+test("F2: Body below the limit is forwarded byte-for-byte", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let receivedBody = null;
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 16,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async (url, opts) => {
+      receivedBody = opts.body;
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+  const payload = bytes(1, 2, 3, 4, 5, 6, 7, 8);
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: payload,
+    })
+  );
+  assert.equal(res.status, 200);
+  await res.text();
+  assert.deepEqual(
+    Array.from(receivedBody),
+    [1, 2, 3, 4, 5, 6, 7, 8],
+    "Exact request bytes must be forwarded unchanged"
+  );
+});
+
+test("F2: Body exactly at the limit is accepted, one byte over is rejected", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: "8",
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+  const rateGate = new RateGate(ctx, env);
+
+  const atLimit = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: bytes(1, 2, 3, 4, 5, 6, 7, 8),
+    })
+  );
+  assert.equal(atLimit.status, 200, "Body exactly at the limit must be accepted");
+  await atLimit.text();
+
+  const overLimit = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: bytes(1, 2, 3, 4, 5, 6, 7, 8, 9),
+    })
+  );
+  assert.equal(overLimit.status, 413, "Body one byte over the limit must be rejected");
+});
+
+test("F2: Declared Content-Length above the limit is rejected before body consumption", async () => {
+  // Direct proof: readBoundedBody must short-circuit on the length header and
+  // never touch the body stream.
+  let bodyRead = false;
+  const fakeRequest = {
+    headers: { get: (name) => (name === "content-length" ? "1000" : null) },
+    body: new ReadableStream(
+      {
+        pull(controller) {
+          bodyRead = true;
+          controller.enqueue(bytes(1));
+          controller.close();
+        },
+      },
+      { highWaterMark: 0 }
+    ),
+  };
+  await assert.rejects(() => readBoundedBody(fakeRequest, 16), BodyTooLargeError);
+  assert.equal(bodyRead, false, "Body stream must not be read when Content-Length exceeds the limit");
+
+  // Integration: the endpoint returns 413 and never dispatches upstream.
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let upstreamCalled = false;
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 16,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      upstreamCalled = true;
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "1000" },
+      body: bytes(1),
+    })
+  );
+  assert.equal(res.status, 413);
+  assert.equal(upstreamCalled, false, "Upstream must not be called for oversized requests");
+});
+
+test("F2: Actual body over the limit is rejected even without a Content-Length header", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let upstreamCalled = false;
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 16,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      upstreamCalled = true;
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+  const bigStream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(100));
+      controller.close();
+    },
+  });
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: bigStream,
+      duplex: "half",
+    })
+  );
+  assert.equal(res.status, 413);
+  assert.equal(upstreamCalled, false);
+});
+
+test("F2: Actual body over the limit is rejected even with an understated Content-Length", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 16,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+  const rateGate = new RateGate(ctx, env);
+  const bigStream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(100));
+      controller.close();
+    },
+  });
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "1" },
+      body: bigStream,
+      duplex: "half",
+    })
+  );
+  assert.equal(res.status, 413, "Understated Content-Length must not bypass the limit");
+});
+
+test("F2: Oversized request does not acquire a queue slot or count as an attempt", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 16,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+  const rateGate = new RateGate(ctx, env);
+
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: bytes(...new Array(50).fill(7)),
+    })
+  );
+  assert.equal(res.status, 413);
+  assert.equal(rateGate.activeTicket, null, "No queue slot may be held after a 413");
+  assert.equal(
+    await ctx.storage.get("rate-state"),
+    undefined,
+    "No attempt may be recorded for a rejected oversized request"
+  );
+
+  // A valid request afterwards must succeed (no leaked queue state).
+  const ok = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: bytes(1),
+    })
+  );
+  assert.equal(ok.status, 200);
+  await ok.text();
+});
+
+test("F2: Request-body read failure returns 400 without leaking queue state", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 1024,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+  const rateGate = new RateGate(ctx, env);
+  const failingStream = new ReadableStream({
+    pull() {
+      throw new Error("socket reset");
+    },
+  });
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: failingStream,
+      duplex: "half",
+    })
+  );
+  assert.equal(res.status, 400);
+  const data = await res.json();
+  assert.equal(data.error, "Failed to read request body");
+  assert.equal(rateGate.activeTicket, null, "No slot may be held after a body-read failure");
+
+  const ok = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: bytes(1, 2, 3),
+    })
+  );
+  assert.equal(ok.status, 200);
+  await ok.text();
+});
+
+test("F2: Empty request body remains valid", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let receivedBody = null;
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 16,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async (url, opts) => {
+      receivedBody = opts.body;
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", { method: "POST" })
+  );
+  assert.equal(res.status, 200);
+  await res.text();
+  assert.equal(receivedBody.byteLength, 0, "Empty body must be forwarded as zero bytes");
+});
+
+test("F2: MAX_BODY_BYTES = 0 rejects any non-empty body but allows empty bodies", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+  const rateGate = new RateGate(ctx, env);
+
+  const empty = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", { method: "POST" })
+  );
+  assert.equal(empty.status, 200, "Empty body must be accepted when the limit is zero");
+
+  const nonEmpty = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: bytes(1),
+    })
+  );
+  assert.equal(nonEmpty.status, 413, "Any non-empty body must be rejected when the limit is zero");
+});
+
+// ==========================================
+// F3 REGRESSION TESTS — Strict configuration parsing
+// ==========================================
+
+test("F3: Missing values select the documented defaults", () => {
+  const cfg = resolveConfig({});
+  assert.equal(cfg.RPM, 40);
+  assert.equal(cfg.COOLDOWN_MS, 1670);
+  assert.equal(cfg.RESPONSE_HEADER_TIMEOUT_MS, 30_000);
+  assert.equal(cfg.STREAM_IDLE_TIMEOUT_MS, 30_000);
+  assert.equal(cfg.MAX_QUEUE_WAIT_MS, 60_000);
+  assert.equal(cfg.MAX_QUEUE_DEPTH, 100);
+  assert.equal(cfg.MAX_BODY_BYTES, 20 * 1024 * 1024);
+});
+
+test("F3: Explicit null and 'null' values select the documented defaults", () => {
+  const cfg = resolveConfig({
+    RPM: null,
+    COOLDOWN_MS: "null",
+    MAX_QUEUE_DEPTH: null,
+    MAX_BODY_BYTES: "null",
+  });
+  assert.equal(cfg.RPM, 40);
+  assert.equal(cfg.COOLDOWN_MS, 1670);
+  assert.equal(cfg.MAX_QUEUE_DEPTH, 100);
+  assert.equal(cfg.MAX_BODY_BYTES, 20 * 1024 * 1024);
+});
+
+test("F3: Empty and whitespace-only strings are rejected", () => {
+  assert.throws(() => resolveConfig({ RPM: "" }), ConfigError);
+  assert.throws(() => resolveConfig({ RPM: "   " }), ConfigError);
+  assert.throws(() => resolveConfig({ COOLDOWN_MS: "\t\n " }), ConfigError);
+  assert.throws(() => resolveConfig({ MAX_BODY_BYTES: "" }), ConfigError);
+});
+
+test("F3: Valid zero is preserved only where it has documented meaning", () => {
+  assert.equal(resolveConfig({ COOLDOWN_MS: 0 }).COOLDOWN_MS, 0);
+  assert.equal(resolveConfig({ COOLDOWN_MS: "0" }).COOLDOWN_MS, 0);
+  assert.equal(resolveConfig({ MAX_QUEUE_DEPTH: 0 }).MAX_QUEUE_DEPTH, 0);
+  assert.equal(resolveConfig({ MAX_QUEUE_DEPTH: "0" }).MAX_QUEUE_DEPTH, 0);
+  assert.equal(resolveConfig({ MAX_BODY_BYTES: 0 }).MAX_BODY_BYTES, 0);
+});
+
+test("F3: Unsupported zero values are rejected", () => {
+  assert.throws(() => resolveConfig({ RPM: 0 }), ConfigError);
+  assert.throws(() => resolveConfig({ STREAM_IDLE_TIMEOUT_MS: "0" }), ConfigError);
+  assert.throws(() => resolveConfig({ MAX_QUEUE_WAIT_MS: 0 }), ConfigError);
+  assert.throws(() => resolveConfig({ RESPONSE_HEADER_TIMEOUT_MS: "0" }), ConfigError);
+});
+
+test("F3: Fractional integer-only values are rejected", () => {
+  assert.throws(() => resolveConfig({ RPM: 40.5 }), ConfigError);
+  assert.throws(() => resolveConfig({ MAX_QUEUE_DEPTH: "3.5" }), ConfigError);
+  assert.throws(() => resolveConfig({ STREAM_IDLE_TIMEOUT_MS: "10.1" }), ConfigError);
+  assert.throws(() => resolveConfig({ MAX_BODY_BYTES: 1.5 }), ConfigError);
+});
+
+test("F3: Negative values are rejected", () => {
+  assert.throws(() => resolveConfig({ RPM: -1 }), ConfigError);
+  assert.throws(() => resolveConfig({ COOLDOWN_MS: -1 }), ConfigError);
+  assert.throws(() => resolveConfig({ MAX_BODY_BYTES: -5 }), ConfigError);
+  assert.throws(() => resolveConfig({ MAX_QUEUE_DEPTH: "-2" }), ConfigError);
+});
+
+test("F3: NaN, infinities, malformed strings, and excessive values are rejected", () => {
+  assert.throws(() => resolveConfig({ RPM: NaN }), ConfigError);
+  assert.throws(() => resolveConfig({ RPM: Infinity }), ConfigError);
+  assert.throws(() => resolveConfig({ RPM: -Infinity }), ConfigError);
+  assert.throws(() => resolveConfig({ RPM: "NaN" }), ConfigError);
+  assert.throws(() => resolveConfig({ RPM: "Infinity" }), ConfigError);
+  assert.throws(() => resolveConfig({ RPM: "-Infinity" }), ConfigError);
+  assert.throws(() => resolveConfig({ RPM: "abc" }), ConfigError);
+  assert.throws(() => resolveConfig({ RPM: "12px" }), ConfigError);
+  assert.throws(() => resolveConfig({ RPM: "0x10" }), ConfigError);
+  assert.throws(() => resolveConfig({ RPM: "1e3" }), ConfigError);
+  assert.throws(() => resolveConfig({ RPM: "1,000" }), ConfigError);
+  assert.throws(() => resolveConfig({ RPM: 1_000_000 }), ConfigError);
+  assert.throws(() => resolveConfig({ MAX_BODY_BYTES: 2 ** 40 }), ConfigError);
+  assert.throws(() => resolveConfig({ STREAM_IDLE_TIMEOUT_MS: 1e12 }), ConfigError);
+});
+
+test("F3: Legacy aliases are honored and canonical names take priority", () => {
+  assert.equal(
+    resolveConfig({ UPSTREAM_TIMEOUT_MS: 5000 }).RESPONSE_HEADER_TIMEOUT_MS,
+    5000
+  );
+  assert.equal(resolveConfig({ QUEUE_TIMEOUT_MS: 1234 }).MAX_QUEUE_WAIT_MS, 1234);
+  assert.equal(resolveConfig({ MAX_QUEUE_SIZE: 5 }).MAX_QUEUE_DEPTH, 5);
+  assert.equal(
+    resolveConfig({ MAX_QUEUE_DEPTH: 7, MAX_QUEUE_SIZE: 9 }).MAX_QUEUE_DEPTH,
+    7,
+    "Canonical name must win over the legacy alias"
+  );
+});
+
+test("F3: String numerics from environment bindings parse correctly", () => {
+  const cfg = resolveConfig({ RPM: "20", COOLDOWN_MS: " 250 ", MAX_BODY_BYTES: "1024" });
+  assert.equal(cfg.RPM, 20);
+  assert.equal(cfg.COOLDOWN_MS, 250);
+  assert.equal(cfg.MAX_BODY_BYTES, 1024);
+});
+
+test("F3: Configuration errors do not reveal configured secrets", () => {
+  let error;
+  try {
+    resolveConfig({ RPM: "not-a-number", NVIDIA_API_KEY: "sk-super-secret-value" });
+  } catch (err) {
+    error = err;
+  }
+  assert.ok(error instanceof ConfigError, "Invalid configuration must throw ConfigError");
+  assert.ok(
+    !error.message.includes("sk-super-secret-value"),
+    "Error message must not contain secret values"
+  );
+});
+
+test("F3: readConfigValue honors spec bounds and rejects unsupported types", () => {
+  const floatSpec = { default: 1, min: 0, max: 10, integer: false, allowZero: true };
+  assert.equal(readConfigValue("2.5", floatSpec, "X"), 2.5);
+  assert.equal(readConfigValue(undefined, floatSpec, "X"), 1);
+  assert.throws(() => readConfigValue("11", floatSpec, "X"), ConfigError);
+  assert.throws(() => readConfigValue({}, floatSpec, "X"), ConfigError);
+});
+
+test("F3: Invalid runtime configuration fails closed with 500 and no secret leak", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const env = {
+    RPM: "definitely-not-a-number",
+    NVIDIA_API_KEY: "sk-do-not-leak",
+    PROXY_KEY: "proxy-secret",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: bytes(1),
+    })
+  );
+  assert.equal(res.status, 500);
+  const text = await res.text();
+  assert.ok(!text.includes("sk-do-not-leak"), "Response must not reveal secrets");
+  assert.ok(!text.includes("proxy-secret"), "Response must not reveal secrets");
+  assert.equal(rateGate.activeTicket, null, "No queue slot may be acquired on config failure");
 });

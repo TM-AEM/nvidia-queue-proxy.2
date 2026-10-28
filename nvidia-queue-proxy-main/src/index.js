@@ -10,6 +10,222 @@ const DEFAULT_RESPONSE_HEADER_TIMEOUT_MS = 30_000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_QUEUE_WAIT_MS = 60_000;
 const DEFAULT_MAX_QUEUE_DEPTH = 100;
+const DEFAULT_MAX_BODY_BYTES = 20 * 1024 * 1024; // 20 MiB
+
+// Safe upper bounds. Timer-based settings share a 24h ceiling to prevent
+// setTimeout overflow; counters get independent ceilings to bound memory.
+const MAX_TIMEOUT_MS = 86_400_000;
+const MAX_RPM_LIMIT = 100_000;
+const MAX_QUEUE_DEPTH_LIMIT = 100_000;
+const MAX_BODY_BYTES_LIMIT = 1_073_741_824; // 1 GiB
+
+// Single source of truth for every environment setting the Worker reads.
+// `envNames` lists the accepted names in priority order (canonical first,
+// legacy aliases after). `min`/`max` are inclusive bounds. `allowZero` marks
+// settings where an explicit 0 has a deliberate, documented meaning.
+const CONFIG_SPECS = {
+  RPM: {
+    envNames: ["RPM"],
+    default: DEFAULT_RPM,
+    min: 1,
+    max: MAX_RPM_LIMIT,
+    integer: true,
+    allowZero: false,
+  },
+  COOLDOWN_MS: {
+    envNames: ["COOLDOWN_MS"],
+    default: DEFAULT_COOLDOWN_MS,
+    min: 0,
+    max: 60_000,
+    integer: true,
+    allowZero: true,
+  },
+  RESPONSE_HEADER_TIMEOUT_MS: {
+    envNames: ["RESPONSE_HEADER_TIMEOUT_MS", "UPSTREAM_TIMEOUT_MS"],
+    default: DEFAULT_RESPONSE_HEADER_TIMEOUT_MS,
+    min: 1,
+    max: MAX_TIMEOUT_MS,
+    integer: true,
+    allowZero: false,
+  },
+  STREAM_IDLE_TIMEOUT_MS: {
+    envNames: ["STREAM_IDLE_TIMEOUT_MS"],
+    default: DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+    min: 1,
+    max: MAX_TIMEOUT_MS,
+    integer: true,
+    allowZero: false,
+  },
+  MAX_QUEUE_WAIT_MS: {
+    envNames: ["MAX_QUEUE_WAIT_MS", "QUEUE_TIMEOUT_MS"],
+    default: DEFAULT_MAX_QUEUE_WAIT_MS,
+    min: 1,
+    max: MAX_TIMEOUT_MS,
+    integer: true,
+    allowZero: false,
+  },
+  MAX_QUEUE_DEPTH: {
+    envNames: ["MAX_QUEUE_DEPTH", "MAX_QUEUE_SIZE"],
+    default: DEFAULT_MAX_QUEUE_DEPTH,
+    min: 0,
+    max: MAX_QUEUE_DEPTH_LIMIT,
+    integer: true,
+    allowZero: true,
+  },
+  MAX_BODY_BYTES: {
+    envNames: ["MAX_BODY_BYTES"],
+    default: DEFAULT_MAX_BODY_BYTES,
+    min: 0,
+    max: MAX_BODY_BYTES_LIMIT,
+    integer: true,
+    allowZero: true,
+  },
+};
+
+export class ConfigError extends Error {
+  constructor(key, message) {
+    super(message);
+    this.name = "ConfigError";
+    this.configKey = key;
+  }
+}
+
+// Strict, deterministic validation. Missing or explicit "null" values fall back
+// to the documented default. Everything else must be a clean, in-range number;
+// ambiguous input (empty/whitespace, NaN, infinities, malformed strings,
+// fractional values for integer-only settings, out-of-range) is rejected
+// rather than silently coerced.
+export function readConfigValue(rawValue, spec, key) {
+  if (rawValue === undefined || rawValue === null || rawValue === "null") {
+    return spec.default;
+  }
+  if (typeof rawValue === "number") {
+    return validateConfigNumber(rawValue, spec, key);
+  }
+  if (typeof rawValue === "string") {
+    const trimmed = rawValue.trim();
+    if (trimmed === "") {
+      throw new ConfigError(
+        key,
+        `Invalid configuration for ${key}: empty or whitespace-only value`
+      );
+    }
+    // Only canonical decimal notation is accepted; exponent, hex, and signed
+    // forms are rejected so parsing stays deterministic across environments.
+    const pattern = spec.integer ? /^-?\d+$/ : /^-?\d+(\.\d+)?$/;
+    if (!pattern.test(trimmed)) {
+      throw new ConfigError(
+        key,
+        `Invalid configuration for ${key}: not a valid number`
+      );
+    }
+    return validateConfigNumber(Number(trimmed), spec, key);
+  }
+  throw new ConfigError(
+    key,
+    `Invalid configuration for ${key}: unsupported value type`
+  );
+}
+
+function validateConfigNumber(num, spec, key) {
+  if (!Number.isFinite(num)) {
+    throw new ConfigError(
+      key,
+      `Invalid configuration for ${key}: not a finite number`
+    );
+  }
+  if (spec.integer && !Number.isInteger(num)) {
+    throw new ConfigError(
+      key,
+      `Invalid configuration for ${key}: must be an integer`
+    );
+  }
+  if (num < spec.min || num > spec.max) {
+    throw new ConfigError(
+      key,
+      `Invalid configuration for ${key}: must be between ${spec.min} and ${spec.max}`
+    );
+  }
+  if (num === 0 && !spec.allowZero) {
+    throw new ConfigError(
+      key,
+      `Invalid configuration for ${key}: zero is not a supported value`
+    );
+  }
+  return num;
+}
+
+export function resolveConfig(env) {
+  const resolved = {};
+  for (const [key, spec] of Object.entries(CONFIG_SPECS)) {
+    let rawValue;
+    for (const name of spec.envNames) {
+      if (env?.[name] !== undefined) {
+        rawValue = env[name];
+        break;
+      }
+    }
+    resolved[key] = readConfigValue(rawValue, spec, key);
+  }
+  return resolved;
+}
+
+export class BodyTooLargeError extends Error {
+  constructor() {
+    super("Request body exceeds the configured maximum size");
+    this.name = "BodyTooLargeError";
+  }
+}
+
+// Reads the request body while enforcing a hard byte ceiling. Content-Length is
+// checked first (cheap early rejection) but is never trusted on its own: the
+// actual streamed bytes are counted, so missing or understated length headers
+// cannot bypass the limit. The exact bytes are preserved for valid requests.
+export async function readBoundedBody(request, maxBytes) {
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const declaredBytes = Number(declared);
+    if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+      throw new BodyTooLargeError();
+    }
+  }
+
+  const bodyStream = request.body;
+  if (!bodyStream) {
+    return new Uint8Array(0);
+  }
+
+  const reader = bodyStream.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        throw new BodyTooLargeError();
+      }
+      chunks.push(value);
+    }
+  } catch (readError) {
+    try {
+      await reader.cancel(readError);
+    } catch {}
+    throw readError;
+  }
+
+  if (chunks.length === 1) {
+    return chunks[0];
+  }
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return combined;
+}
 
 export function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
@@ -89,6 +305,10 @@ export class RateGate extends DurableObject {
     this.fetchImpl =
       typeof env?.__fetch === "function" ? env.__fetch : fetch;
     this.getFetchImpl = () => this.fetchImpl || (typeof this.env?.__fetch === "function" ? this.env.__fetch : fetch);
+    this.setTimeoutImpl =
+      typeof env?.__setTimeout === "function" ? env.__setTimeout : setTimeout;
+    this.clearTimeoutImpl =
+      typeof env?.__clearTimeout === "function" ? env.__clearTimeout : clearTimeout;
   }
 
   cleanTicket(ticket) {
@@ -229,49 +449,40 @@ export class RateGate extends DurableObject {
       return new Response("Not found", { status: 404 });
     }
 
-    const rpm = Math.max(
-      1,
-      Math.min(1000, Number(this.env.RPM) || DEFAULT_RPM)
-    );
-    const rawCooldown = this.env.COOLDOWN_MS;
-    const cooldownMs = Math.max(
-      0,
-      Math.min(
-        60_000,
-        rawCooldown !== undefined && rawCooldown !== null && !Number.isNaN(Number(rawCooldown))
-          ? Number(rawCooldown)
-          : DEFAULT_COOLDOWN_MS
-      )
-    );
-    const responseHeaderTimeoutMs = Math.max(
-      1,
-      Number(
-        this.env.RESPONSE_HEADER_TIMEOUT_MS ?? this.env.UPSTREAM_TIMEOUT_MS
-      ) || DEFAULT_RESPONSE_HEADER_TIMEOUT_MS
-    );
-    const streamIdleTimeoutMs = Math.max(
-      1,
-      Number(this.env.STREAM_IDLE_TIMEOUT_MS) || DEFAULT_STREAM_IDLE_TIMEOUT_MS
-    );
-    const maxQueueWaitMs = Math.max(
-      1,
-      Number(
-        this.env.MAX_QUEUE_WAIT_MS ?? this.env.QUEUE_TIMEOUT_MS
-      ) || DEFAULT_MAX_QUEUE_WAIT_MS
-    );
-    const rawQueueDepth = this.env.MAX_QUEUE_DEPTH ?? this.env.MAX_QUEUE_SIZE;
-    const maxQueueDepth = Math.max(
-      0,
-      rawQueueDepth !== undefined && rawQueueDepth !== null && !Number.isNaN(Number(rawQueueDepth))
-        ? Number(rawQueueDepth)
-        : DEFAULT_MAX_QUEUE_DEPTH
-    );
+    // F3: Strict, fail-closed configuration parsing. Invalid configuration
+    // rejects the request rather than running with a silently coerced value.
+    let config;
+    try {
+      config = resolveConfig(this.env);
+    } catch (configError) {
+      if (!(configError instanceof ConfigError)) throw configError;
+      return Response.json(
+        { error: "Server configuration error" },
+        { status: 500 }
+      );
+    }
+    const {
+      RPM: rpm,
+      COOLDOWN_MS: cooldownMs,
+      RESPONSE_HEADER_TIMEOUT_MS: responseHeaderTimeoutMs,
+      STREAM_IDLE_TIMEOUT_MS: streamIdleTimeoutMs,
+      MAX_QUEUE_WAIT_MS: maxQueueWaitMs,
+      MAX_QUEUE_DEPTH: maxQueueDepth,
+      MAX_BODY_BYTES: maxBodyBytes,
+    } = config;
 
-    // F2: Read request body BEFORE acquiring exclusive queue slot
+    // F2: Read request body BEFORE acquiring exclusive queue slot, enforcing a
+    // bounded size limit without trusting Content-Length alone.
     let body;
     try {
-      body = await request.arrayBuffer();
-    } catch (readErr) {
+      body = await readBoundedBody(request, maxBodyBytes);
+    } catch (bodyError) {
+      if (bodyError instanceof BodyTooLargeError) {
+        return Response.json(
+          { error: "Request body too large" },
+          { status: 413 }
+        );
+      }
       if (request.signal?.aborted) {
         return Response.json({ error: "Client cancelled" }, { status: 499 });
       }
@@ -529,22 +740,27 @@ export class RateGate extends DurableObject {
 
       const clearIdleTimer = () => {
         if (idleTimer !== null) {
-          clearTimeout(idleTimer);
+          this.clearTimeoutImpl(idleTimer);
           idleTimer = null;
         }
       };
 
-      const resetIdleTimer = () => {
+      // The idle timer measures upstream read inactivity ONLY. It is armed when
+      // we start waiting for the next upstream read and disarmed the instant
+      // that read settles, before any downstream delivery work. A downstream
+      // consumer that pauses between chunks therefore never trips the timeout.
+      const armIdleTimer = () => {
         clearIdleTimer();
         if (released || idleTimedOut) return;
-        idleTimer = setTimeout(async () => {
+        idleTimer = this.setTimeoutImpl(async () => {
+          idleTimer = null;
           if (released || idleTimedOut) return;
           idleTimedOut = true;
           const timeoutErr = new Error("Stream idle timeout");
-          await cancelUpstream(timeoutErr);
           try {
             controllerRef?.error(timeoutErr);
           } catch {}
+          await cancelUpstream(timeoutErr);
           await finish();
         }, streamIdleTimeoutMs);
       };
@@ -560,20 +776,37 @@ export class RateGate extends DurableObject {
       };
       upstreamAbortController.signal.addEventListener("abort", onAbortStream, { once: true });
 
-      const stream = new ReadableStream({
-        start(controller) {
-          controllerRef = controller;
-          resetIdleTimer();
-        },
-        async pull(controller) {
-          resetIdleTimer();
-          try {
-            const result = await reader.read();
-            if (idleTimedOut) {
+      // highWaterMark 0 means the proxy only reads upstream when the downstream
+      // consumer actually demands a chunk: no read-ahead. Combined with arming
+      // the idle timer around reader.read(), this guarantees the timer measures
+      // upstream read inactivity only and never fires for a paused consumer.
+      const stream = new ReadableStream(
+        {
+          start(controller) {
+            controllerRef = controller;
+          },
+          async pull(controller) {
+            armIdleTimer();
+            let result;
+            try {
+              result = await reader.read();
+            } catch (readError) {
+              clearIdleTimer();
+              if (idleTimedOut || released || upstreamAbortController.signal.aborted) {
+                return;
+              }
+              try {
+                controller.error(readError);
+              } catch {}
+              await cancelUpstream(readError);
+              await finish();
               return;
             }
+            // The upstream read settled: disarm immediately, before waiting on
+            // downstream demand or performing any delivery work.
+            clearIdleTimer();
+            if (idleTimedOut || released) return;
             if (result.done) {
-              clearIdleTimer();
               if (cancelPromise) {
                 await cancelPromise;
               }
@@ -581,23 +814,16 @@ export class RateGate extends DurableObject {
               await finish();
             } else {
               controller.enqueue(result.value);
-              resetIdleTimer();
             }
-          } catch (readError) {
+          },
+          async cancel(reason) {
             clearIdleTimer();
-            await cancelUpstream(readError);
-            try {
-              controller.error(readError);
-            } catch {}
+            await cancelUpstream(reason);
             await finish();
-          }
+          },
         },
-        async cancel(reason) {
-          clearIdleTimer();
-          await cancelUpstream(reason);
-          await finish();
-        },
-      });
+        { highWaterMark: 0 }
+      );
 
       return new Response(stream, {
         status: upstreamResponse.status,
