@@ -32,6 +32,35 @@ const {
   BodyReadTimeoutError,
 } = await import("../src/index.js");
 
+// ==========================================
+// Platform-function receiver regression (Illegal invocation)
+// ==========================================
+// The default fetch path must invoke the global fetch without a receiver. The
+// spy below is a strict-mode function that records its `this`, so a regression
+// to the old `this.fetchImpl(...)` pattern (receiver = RateGate) is detected as
+// `this === the RateGate instance` instead of `undefined`.
+let fetchReceiver = "not-called";
+function strictFetchSpy(...args) {
+  fetchReceiver =
+    this === undefined ? "undefined" : this === globalThis ? "globalThis" : "object";
+  return Promise.resolve(new Response("spy", { status: 200 }));
+}
+
+function makeDefaultFetchEnv(extra = {}) {
+  return {
+    PROXY_KEY: "test-proxy-key",
+    NVIDIA_API_KEY: "test-nvidia-api-key",
+    COOLDOWN_MS: "0",
+    RPM: "1000",
+    // No __fetch: exercise the default (global fetch) path.
+    __now: () => Date.now(),
+    __sleep: () => Promise.resolve(),
+    __setTimeout: (fn, ms) => setTimeout(fn, ms),
+    __clearTimeout: (id) => clearTimeout(id),
+    ...extra,
+  };
+}
+
 function createMockCtx() {
   const store = new Map();
   return {
@@ -2734,4 +2763,46 @@ test("1G.1-D2: A timeout winning first cannot be reversed by a late read complet
 
   await assert.rejects(() => promise, BodyReadTimeoutError, "The timeout outcome must stand");
   assert.equal(timers.pendingCount(), 0, "No timer may remain after the terminal path");
+});
+
+// ==========================================
+// NQP-02: Global-fetch receiver regression (unit)
+// ==========================================
+test("NQP-02: default fetch path invokes the global fetch with no receiver (no Illegal invocation)", async () => {
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = strictFetchSpy;
+  try {
+    fetchReceiver = "not-called";
+    const ctx = createMockCtx();
+    const rateGate = new RateGate(ctx, makeDefaultFetchEnv());
+    const req = new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ message: "hi" }),
+    });
+    const res = await rateGate.fetch(req);
+    assert.equal(res.status, 200, "The proxied response must be propagated, not a 502");
+    assert.equal(fetchReceiver, "undefined", "The global fetch must be called without a receiver (this === undefined)");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("NQP-02: injected env.__fetch seam is still honored", async () => {
+  const ctx = createMockCtx();
+  let called = false;
+  const env = makeDefaultFetchEnv({
+    __fetch: async () => {
+      called = true;
+      return new Response("injected", { status: 200 });
+    },
+  });
+  const rateGate = new RateGate(ctx, env);
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({ message: "hi" }),
+  });
+  const res = await rateGate.fetch(req);
+  assert.equal(res.status, 200);
+  assert.equal(called, true, "env.__fetch must be used when provided");
+  assert.equal(await res.text(), "injected");
 });

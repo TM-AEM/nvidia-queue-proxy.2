@@ -1,6 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
 
 const NVIDIA_API = "https://integrate.api.nvidia.com";
+
+// Invoke the global fetch without a receiver. workerd host functions throw
+// "Illegal invocation" when called with a non-undefined `this`, so the global
+// fetch must never be invoked as an object property (e.g. `this.fetchImpl(...)`).
+// Wrapping it in an arrow preserves the injectable `env.__fetch` test seam.
+const boundFetch = (...args) => fetch(...args);
+
 const WINDOW_MS = 60_000;
 const DEFAULT_RPM = 40;
 const DEFAULT_COOLDOWN_MS = 1_670;
@@ -471,7 +478,7 @@ export class RateGate extends DurableObject {
     this.fetchImpl =
       typeof env?.__fetch === "function"
         ? env.__fetch
-        : fetch;
+        : boundFetch;
 
     this.getFetchImpl = () =>
       this.fetchImpl ||
