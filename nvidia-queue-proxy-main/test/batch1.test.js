@@ -2806,3 +2806,224 @@ test("NQP-02: injected env.__fetch seam is still honored", async () => {
   assert.equal(called, true, "env.__fetch must be used when provided");
   assert.equal(await res.text(), "injected");
 });
+
+// ==========================================
+// NQP-RL-02: Rate-limiter regression tests
+// ==========================================
+// Direct evidence that RateGate enforces: (1) a minimum interval between
+// consecutive upstream starts equal to the cooldown, (2) the sliding-window
+// request limit at its 60s boundary, (3) strict one-at-a-time upstream
+// serialization, and (4) that queued requests and 429 retries cannot bypass the
+// limiter. All timing is driven by the injectable FakeClock / deferred upstream
+// (no real sleeps, no network, no NVIDIA credentials).
+
+const RL_COOLDOWN_MS = 1_670;
+const RL_WINDOW_MS = 60_000;
+
+test("NQP-RL-02: consecutive upstream starts are spaced by at least the cooldown", async () => {
+  const clock = new FakeClock(1_000_000);
+  const ctx = createMockCtx();
+  const starts = [];
+  const env = {
+    RPM: 40,
+    COOLDOWN_MS: RL_COOLDOWN_MS,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      starts.push(clock.now());
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+  const count = 5;
+
+  await Promise.all(
+    Array.from({ length: count }, (_, i) =>
+      rateGate
+        .fetch(
+          new Request("https://proxy.internal/v1/chat/completions", {
+            method: "POST",
+            headers: { "x-req-id": String(i) },
+            body: "{}",
+          })
+        )
+        .then((res) => res.text())
+    )
+  );
+
+  assert.equal(starts.length, count, "every queued request must reach the upstream");
+  const ordered = [...starts].sort((a, b) => a - b);
+  const gaps = ordered.slice(1).map((t, i) => t - ordered[i]);
+
+  for (const gap of gaps) {
+    assert.ok(
+      gap >= RL_COOLDOWN_MS,
+      `consecutive upstream starts must be >= ${RL_COOLDOWN_MS}ms apart (got ${gap}ms)`
+    );
+  }
+  assert.deepEqual(
+    gaps,
+    [RL_COOLDOWN_MS, RL_COOLDOWN_MS, RL_COOLDOWN_MS, RL_COOLDOWN_MS],
+    "with the fake clock the spacing is exactly the cooldown (no extra padding)"
+  );
+});
+
+test("NQP-RL-02: sliding-window limit is enforced at the 60s boundary", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const starts = [];
+  const env = {
+    RPM: 3,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      starts.push(clock.now());
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+  const count = 6;
+
+  await Promise.all(
+    Array.from({ length: count }, (_, i) =>
+      rateGate
+        .fetch(
+          new Request("https://proxy.internal/v1/chat/completions", {
+            method: "POST",
+            headers: { "x-req-id": String(i) },
+            body: "{}",
+          })
+        )
+        .then((res) => res.text())
+    )
+  );
+
+  const ordered = [...starts].sort((a, b) => a - b);
+  assert.deepEqual(
+    ordered,
+    [0, 0, 0, RL_WINDOW_MS, RL_WINDOW_MS, RL_WINDOW_MS],
+    "the 4th request must wait for the oldest start to leave the 60s window"
+  );
+
+  for (const t of ordered) {
+    const inWindow = ordered.filter(
+      (x) => x >= t && x < t + RL_WINDOW_MS
+    ).length;
+    assert.ok(
+      inWindow <= 3,
+      `no 60s window may contain more than RPM=3 starts (found ${inWindow} at t=${t})`
+    );
+  }
+});
+
+test("NQP-RL-02: at most one upstream request is in flight at a time", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const releaseUpstream = [];
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    // Blocks until the test releases it, so overlap (if any) is directly observable.
+    __fetch: async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => releaseUpstream.push(resolve));
+      inFlight -= 1;
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+  const count = 5;
+
+  const waitFor = async (predicate, label) => {
+    for (let i = 0; i < 500; i++) {
+      if (predicate()) return;
+      await tick();
+    }
+    assert.fail(`Timed out waiting for ${label}`);
+  };
+
+  const settled = Array.from({ length: count }, (_, i) =>
+    rateGate
+      .fetch(
+        new Request("https://proxy.internal/v1/chat/completions", {
+          method: "POST",
+          headers: { "x-req-id": String(i) },
+          body: "{}",
+        })
+      )
+      .then((res) => res.text())
+  );
+
+  await waitFor(
+    () => releaseUpstream.length >= 1,
+    "the first upstream call to start"
+  );
+  assert.equal(
+    inFlight,
+    1,
+    "only one upstream call may be in flight while the rest wait"
+  );
+
+  for (let released = 0; released < count; released++) {
+    releaseUpstream[released]();
+    await waitFor(
+      () => released === count - 1 || releaseUpstream.length >= released + 2,
+      `upstream call ${released + 2} to start only after the previous resolves`
+    );
+  }
+
+  await Promise.all(settled);
+  assert.equal(maxInFlight, 1, "no two upstream calls may ever overlap");
+});
+
+test("NQP-RL-02: a 429 retry cannot bypass the cooldown between upstream attempts", async () => {
+  const clock = new FakeClock(1_000_000);
+  const ctx = createMockCtx();
+  const attemptTimes = [];
+  let attempt = 0;
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: RL_COOLDOWN_MS,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      attemptTimes.push(clock.now());
+      attempt += 1;
+      if (attempt === 1) {
+        // No Retry-After: the exponential backoff (1000ms) alone is below the
+        // cooldown, so the limiter must supply the remaining gap.
+        return new Response(JSON.stringify({ error: "rate limit" }), {
+          status: 429,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+  await res.text();
+
+  assert.equal(attemptTimes.length, 2, "one initial attempt plus one retry");
+  const gap = attemptTimes[1] - attemptTimes[0];
+  assert.ok(
+    gap >= RL_COOLDOWN_MS,
+    `the retry must wait at least the ${RL_COOLDOWN_MS}ms cooldown after the previous attempt (got ${gap}ms)`
+  );
+});
