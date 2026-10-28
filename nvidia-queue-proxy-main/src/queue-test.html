@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ar">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Queue Test</title>
+<h3>اختبار طابور البروكسي</h3>
+
+<p>أدخل مفتاح PROXY_KEY فقط، وليس مفتاح NVIDIA.</p>
+<input id="key" type="password" placeholder="PROXY_KEY">
+<button id="run" onclick="runTest()">اختبر 3 طلبات</button>
+<pre id="out">جاهز للاختبار</pre>
+
+<script>
+async function runTest() {
+  const key = document.getElementById("key").value.trim();
+  const out = document.getElementById("out");
+  const button = document.getElementById("run");
+
+  if (!key) {
+    out.textContent = "أدخل PROXY_KEY أولًا.";
+    return;
+  }
+
+  button.disabled = true;
+  out.textContent = "جارٍ إرسال 3 طلبات بالتزامن...";
+
+  const url =
+    "https://nvidia-queue-proxy.5s5k7kk.workers.dev/v1/chat/completions";
+
+  const body = {
+    model: "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    messages: [{ role: "user", content: "Reply with OK" }],
+    max_tokens: 100,
+    stream: false
+  };
+
+  const results = await Promise.all([1, 2, 3].map(async n => {
+    const start = performance.now();
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + key
+        },
+        body: JSON.stringify(body)
+      });
+
+      await response.text();
+
+      return `الطلب ${n}: HTTP ${response.status} — ${Math.round(performance.now() - start)} ms`;
+    } catch (error) {
+      return `الطلب ${n}: فشل الاتصال — ${error.message}`;
+    }
+  }));
+
+  out.textContent = results.join("\n");
+  button.disabled = false;
+}
+</script>
+</html>

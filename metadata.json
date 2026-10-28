@@ -1,0 +1,6 @@
+{
+  "name": "NVIDIA Queue Proxy",
+  "description": "Production-grade rate-limiting, retrying, and serialization queue proxy for NVIDIA NIM APIs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

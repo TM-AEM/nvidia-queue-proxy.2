@@ -1,0 +1,12 @@
+{
+  "name": "nvidia-queue-proxy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "test": "node --test test/batch1.test.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.126.0"
+  }
+}

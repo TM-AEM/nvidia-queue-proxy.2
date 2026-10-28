@@ -1,0 +1,1404 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { register } from "node:module";
+
+// Mock cloudflare:workers for Node environment
+register(
+  "data:text/javascript," +
+    encodeURIComponent(`
+export async function resolve(specifier, context, nextResolve) {
+  if (specifier === "cloudflare:workers") {
+    return {
+      url: "data:text/javascript," + encodeURIComponent("export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }"),
+      shortCircuit: true
+    };
+  }
+  return nextResolve(specifier, context);
+}
+`),
+  import.meta.url
+);
+
+const {
+  RateGate,
+  retryAfterMs,
+  computeBackoffDelay,
+  safeResponseHeaders,
+} = await import("../src/index.js");
+
+function createMockCtx() {
+  const store = new Map();
+  return {
+    storage: {
+      store,
+      async get(key) {
+        if (!store.has(key)) return undefined;
+        return JSON.parse(JSON.stringify(store.get(key)));
+      },
+      async put(key, value) {
+        store.set(key, JSON.parse(JSON.stringify(value)));
+      },
+    },
+  };
+}
+
+class FakeClock {
+  constructor(initialTime = 1_000_000) {
+    this.currentTime = initialTime;
+    this.sleepCalls = [];
+  }
+
+  now() {
+    return this.currentTime;
+  }
+
+  advance(ms) {
+    this.currentTime += ms;
+  }
+
+  sleep(ms, signal) {
+    this.sleepCalls.push({ ms, time: this.currentTime });
+    this.currentTime += ms;
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        return reject(signal.reason || new Error("Aborted"));
+      }
+      resolve();
+    });
+  }
+}
+
+// ==========================================
+// T2 TESTS — Retry-After & Exponential Backoff
+// ==========================================
+
+test("T2: retryAfterMs parses absent, numeric, date-form, and malformed values", () => {
+  const baseTime = 1_000_000;
+
+  // Absent header
+  assert.equal(retryAfterMs(new Response("ok"), baseTime), 0);
+  assert.equal(retryAfterMs(null, baseTime), 0);
+
+  // Numeric values
+  assert.equal(
+    retryAfterMs(new Response("ok", { headers: { "Retry-After": "0" } }), baseTime),
+    0
+  );
+  assert.equal(
+    retryAfterMs(new Response("ok", { headers: { "Retry-After": "5" } }), baseTime),
+    5000
+  );
+  assert.equal(
+    retryAfterMs(new Response("ok", { headers: { "Retry-After": "1.5" } }), baseTime),
+    1500
+  );
+  assert.equal(
+    retryAfterMs(new Response("ok", { headers: { "Retry-After": " 10  " } }), baseTime),
+    10000
+  );
+
+  // Negative numeric value -> invalid -> 0
+  assert.equal(
+    retryAfterMs(new Response("ok", { headers: { "Retry-After": "-5" } }), baseTime),
+    0
+  );
+
+  // Malformed strings
+  assert.equal(
+    retryAfterMs(new Response("ok", { headers: { "Retry-After": "invalid-str" } }), baseTime),
+    0
+  );
+  assert.equal(
+    retryAfterMs(new Response("ok", { headers: { "Retry-After": "NaN" } }), baseTime),
+    0
+  );
+
+  // HTTP Date form
+  const futureDate = new Date(baseTime + 12_000).toUTCString();
+  assert.equal(
+    retryAfterMs(new Response("ok", { headers: { "Retry-After": futureDate } }), baseTime),
+    12000
+  );
+
+  const pastDate = new Date(baseTime - 5_000).toUTCString();
+  assert.equal(
+    retryAfterMs(new Response("ok", { headers: { "Retry-After": pastDate } }), baseTime),
+    0
+  );
+});
+
+test("T2: computeBackoffDelay respects larger of exponential delay and Retry-After, capped at 30s", () => {
+  const now = 100_000;
+
+  // retryIndex 0: exp = 1000ms. If Retry-After absent -> 1000ms
+  assert.equal(computeBackoffDelay(0, null, { now }), 1000);
+
+  // retryIndex 0: exp = 1000ms. If Retry-After is 5000ms -> 5000ms
+  const resp5s = new Response("429", { headers: { "Retry-After": "5" } });
+  assert.equal(computeBackoffDelay(0, resp5s, { now }), 5000);
+
+  // retryIndex 2: exp = 4000ms. If Retry-After is 2000ms -> 4000ms (exp is larger)
+  const resp2s = new Response("429", { headers: { "Retry-After": "2" } });
+  assert.equal(computeBackoffDelay(2, resp2s, { now }), 4000);
+
+  // retryIndex 3: exp = 8000ms. If Retry-After is 20s -> 20000ms
+  const resp20s = new Response("429", { headers: { "Retry-After": "20" } });
+  assert.equal(computeBackoffDelay(3, resp20s, { now }), 20000);
+
+  // 30s cap test: Retry-After is 45s -> capped at 30000ms
+  const resp45s = new Response("429", { headers: { "Retry-After": "45" } });
+  assert.equal(computeBackoffDelay(0, resp45s, { now }), 30000);
+
+  // 30s cap test: retryIndex 5 (exp = 32000ms) -> capped at 30000ms
+  assert.equal(computeBackoffDelay(5, null, { now }), 30000);
+
+  // Jitter support
+  const withJitter = computeBackoffDelay(0, resp5s, {
+    now,
+    jitterFn: (d) => d + 42,
+  });
+  assert.equal(withJitter, 5042);
+});
+
+test("T2: RateGate retries at most 5 times on 429 and returns final 429 when exhausted", async () => {
+  const clock = new FakeClock(1_000);
+  const ctx = createMockCtx();
+  let attemptCount = 0;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async (url, opts) => {
+      attemptCount++;
+      return new Response(JSON.stringify({ error: "rate limit exceeded" }), {
+        status: 429,
+        headers: {
+          "Retry-After": "2",
+          "content-type": "application/json",
+          "x-custom-upstream": "test-val",
+        },
+      });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({ message: "hi" }),
+  });
+
+  const res = await rateGate.fetch(req);
+
+  // 1 initial attempt + 5 retries = 6 attempts total
+  assert.equal(attemptCount, 6, "Must make initial attempt plus 5 retries (6 total)");
+  assert.equal(res.status, 429);
+  assert.equal(res.headers.get("x-custom-upstream"), "test-val");
+  const body = await res.json();
+  assert.equal(body.error, "rate limit exceeded");
+});
+
+test("T2: RateGate does not retry unrelated HTTP statuses", async () => {
+  const clock = new FakeClock(1_000);
+  const ctx = createMockCtx();
+  let attemptCount = 0;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      attemptCount++;
+      return new Response("Bad request", { status: 400 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    body: "{}",
+  });
+
+  const res = await rateGate.fetch(req);
+  assert.equal(attemptCount, 1, "Must not retry HTTP 400");
+  assert.equal(res.status, 400);
+  await res.text();
+});
+
+// ==========================================
+// T1 TESTS — Attempt Accounting & Sliding Window
+// ==========================================
+
+test("T1: Counts every upstream attempt including 429 retries and network exceptions", async () => {
+  const clock = new FakeClock(10_000);
+  const ctx = createMockCtx();
+  let attempt = 0;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      attempt++;
+      if (attempt === 1) {
+        // Attempt 1: 429
+        return new Response("Too Many Requests", {
+          status: 429,
+          headers: { "Retry-After": "1" },
+        });
+      }
+      if (attempt === 2) {
+        // Attempt 2: Network failure
+        throw new Error("Connection reset by peer");
+      }
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    body: "{}",
+  });
+
+  const res = await rateGate.fetch(req);
+  assert.equal(res.status, 502);
+
+  // Inspect persisted state
+  const state = await ctx.storage.get("rate-state");
+  assert.ok(state, "State must be persisted in DO storage");
+  assert.equal(
+    state.starts.length,
+    2,
+    "Both the 429 attempt and the network failure attempt must be in starts"
+  );
+  assert.equal(attempt, 2);
+});
+
+test("T1: Records attempt timestamp immediately before dispatching upstream", async () => {
+  const clock = new FakeClock(50_000);
+  const ctx = createMockCtx();
+  let recordedStartsBeforeHeaders = null;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      // In the middle of fetch, before returning headers, check what is in storage
+      const currentState = await ctx.storage.get("rate-state");
+      recordedStartsBeforeHeaders = [...currentState.starts];
+      clock.advance(500); // simulate fetch duration
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    body: "{}",
+  });
+
+  const res = await rateGate.fetch(req);
+  await res.text();
+  assert.ok(recordedStartsBeforeHeaders, "Attempt must be saved before headers arrive");
+  assert.equal(recordedStartsBeforeHeaders.length, 1);
+  assert.equal(recordedStartsBeforeHeaders[0], 50_000);
+});
+
+test("T1: Sliding window 60-second exact boundary behavior", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  // Populate state with 2 requests at t = 1000 and t = 2000
+  await ctx.storage.put("rate-state", {
+    starts: [1000, 2000],
+    lastSendAt: 2000,
+    lastCompletionAt: 2500,
+  });
+
+  let dispatchedTime = 0;
+  const env = {
+    RPM: 2, // Limit is 2 requests per 60s
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      dispatchedTime = clock.now();
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Set clock to t = 5000: both [1000, 2000] are within 60s.
+  clock.currentTime = 5000;
+
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    body: "{}",
+  });
+
+  const res = await rateGate.fetch(req);
+  await res.text();
+
+  // The oldest entry at 1000 expires at 1000 + 60,000 = 61,000.
+  // So dispatch must have waited until 61,000!
+  assert.equal(dispatchedTime, 61_000, "Must wait exactly until oldest attempt expires at 61,000");
+
+  const finalState = await ctx.storage.get("rate-state");
+  // At t = 61,000, attempt at 1000 expired (61000 - 1000 = 60000 >= 60000).
+  // Remaining were [2000], plus new attempt at [61000]
+  assert.deepEqual(finalState.starts, [2000, 61000]);
+});
+
+test("T1: Preserves completion-based cooldown behavior", async () => {
+  const clock = new FakeClock(10_000);
+  const ctx = createMockCtx();
+
+  // Previous request completed at t = 10,000. Cooldown is 1670ms.
+  await ctx.storage.put("rate-state", {
+    starts: [8000],
+    lastSendAt: 8000,
+    lastCompletionAt: 10_000,
+  });
+
+  let dispatchedTime = 0;
+  const env = {
+    RPM: 40,
+    COOLDOWN_MS: 1670,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      dispatchedTime = clock.now();
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  // Current time is 10,500 (500ms after completion; 1170ms left in cooldown)
+  clock.currentTime = 10_500;
+
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    body: "{}",
+  });
+
+  const res = await rateGate.fetch(req);
+  await res.text();
+  assert.equal(dispatchedTime, 11_670, "Must wait for 1670ms completion cooldown (10000 + 1670)");
+});
+
+// ==========================================
+// T3 TESTS — Timeouts, Queue Bounds, Cancellation
+// ==========================================
+
+test("T3: Maximum queue depth rejection with 503 and Retry-After", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  let unblockFirst;
+  const firstRunning = new Promise((resolve) => {
+    unblockFirst = resolve;
+  });
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 2000,
+    MAX_QUEUE_DEPTH: 2,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      await firstRunning;
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Request 1: becomes active
+  const p1 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "1",
+    })
+  );
+
+  // Wait a tick for request 1 to acquire slot
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Request 2 & 3: queue depth is 2, so they enter the queue
+  const p2 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "2",
+    })
+  );
+  const p3 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "3",
+    })
+  );
+
+  // Request 4: queue depth is already 2 -> rejected immediately with 503!
+  const res4 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "4",
+    })
+  );
+
+  assert.equal(res4.status, 503);
+  assert.equal(res4.headers.get("Retry-After"), "2");
+  const data4 = await res4.json();
+  assert.equal(data4.error, "Queue depth exceeded");
+
+  // Clean up remaining by unblocking first and consuming streams sequentially
+  unblockFirst();
+  const r1 = await p1;
+  await r1.text();
+  const r2 = await p2;
+  await r2.text();
+  const r3 = await p3;
+  await r3.text();
+});
+
+test("T3: Maximum queue wait timeout rejects with 503 and Retry-After without blocking subsequent requests", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  let unblockFirst;
+  const firstBlock = new Promise((resolve) => {
+    unblockFirst = resolve;
+  });
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 1500,
+    MAX_QUEUE_WAIT_MS: 50, // Short wait timeout for testing
+    MAX_QUEUE_DEPTH: 10,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      await firstBlock;
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Request 1 blocks slot
+  const p1 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "1",
+    })
+  );
+
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Request 2 enters queue
+  const p2 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "2",
+    })
+  );
+
+  // Wait so Request 2 hits MAX_QUEUE_WAIT_MS (50ms)
+  const res2 = await p2;
+  assert.equal(res2.status, 503);
+  assert.equal(res2.headers.get("Retry-After"), "2");
+  const data2 = await res2.json();
+  assert.equal(data2.error, "Maximum queue wait exceeded");
+
+  // Now unblock Request 1 and consume it
+  unblockFirst();
+  const res1 = await p1;
+  assert.equal(res1.status, 200);
+  await res1.text();
+
+  // Request 3 arrives after Request 2 timed out — must not deadlock!
+  const res3 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "3",
+    })
+  );
+  assert.equal(res3.status, 200);
+  await res3.text();
+});
+
+test("T3: Client cancellation in queue removes request without deadlocking queue", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  let unblockFirst;
+  const firstBlock = new Promise((resolve) => {
+    unblockFirst = resolve;
+  });
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      await firstBlock;
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Request 1 holds slot
+  const p1 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "1",
+    })
+  );
+
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Request 2 waits in queue with an AbortController
+  const abortCtrl2 = new AbortController();
+  const p2 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "2",
+      signal: abortCtrl2.signal,
+    })
+  );
+
+  // Request 3 also waits in queue
+  const p3 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "3",
+    })
+  );
+
+  // Abort request 2 while in queue
+  abortCtrl2.abort();
+  const res2 = await p2;
+  assert.equal(res2.status, 499);
+
+  // Unblock request 1
+  unblockFirst();
+  const res1 = await p1;
+  assert.equal(res1.status, 200);
+  await res1.text();
+
+  // Request 3 must proceed smoothly and not deadlock!
+  const res3 = await p3;
+  assert.equal(res3.status, 200);
+  await res3.text();
+});
+
+test("T3: Upstream response header timeout aborts fetch and returns 504", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let upstreamSignalAborted = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    RESPONSE_HEADER_TIMEOUT_MS: 40,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: (url, opts) => {
+      return new Promise((resolve, reject) => {
+        opts.signal.addEventListener("abort", () => {
+          upstreamSignalAborted = true;
+          reject(new DOMException("The operation was aborted", "AbortError"));
+        });
+      });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+
+  assert.equal(res.status, 504);
+  assert.ok(upstreamSignalAborted, "Upstream fetch must have received abort signal");
+});
+
+test("T3: Slot is not released until previous upstream operation confirms stopped", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  let firstCalled = false;
+  let op1Active = false;
+  let op2StartedWhileOp1Active = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    RESPONSE_HEADER_TIMEOUT_MS: 50,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async (url, opts) => {
+      if (!firstCalled) {
+        firstCalled = true;
+        op1Active = true;
+        return new Promise((resolve, reject) => {
+          opts.signal.addEventListener("abort", async () => {
+            // Simulate delay for upstream connection shutdown
+            await new Promise((r) => setTimeout(r, 20));
+            op1Active = false;
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        });
+      } else {
+        if (op1Active) {
+          op2StartedWhileOp1Active = true;
+        }
+        return new Response("ok", { status: 200 });
+      }
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Request 1 will hit response header timeout (50ms)
+  const p1 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "1",
+    })
+  );
+
+  // Request 2 waits in queue
+  const p2 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "2",
+    })
+  );
+
+  const [res1, res2] = await Promise.all([p1, p2]);
+  assert.equal(res1.status, 504);
+  assert.equal(res2.status, 200);
+  await res2.text();
+  assert.equal(
+    op2StartedWhileOp1Active,
+    false,
+    "Second request must never start while first request is active"
+  );
+});
+
+test("T3: Stream idle timeout aborts upstream and unblocks queue", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let upstreamReaderCancelled = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    STREAM_IDLE_TIMEOUT_MS: 40,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async (url, opts) => {
+      const stream = new ReadableStream({
+        async pull(controller) {
+          await new Promise((resolve, reject) => {
+            opts.signal.addEventListener("abort", () => {
+              upstreamReaderCancelled = true;
+              reject(opts.signal.reason);
+            });
+          });
+        },
+        cancel() {
+          upstreamReaderCancelled = true;
+        },
+      });
+      return new Response(stream, { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res1 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "1",
+    })
+  );
+
+  assert.equal(res1.status, 200);
+  const reader = res1.body.getReader();
+
+  // Read should reject when idle timeout fires
+  await assert.rejects(async () => {
+    await reader.read();
+  });
+
+  assert.ok(upstreamReaderCancelled, "Upstream stream reader must be cancelled on idle timeout");
+
+  // Verify next request can execute without deadlock
+  let secondRan = false;
+  rateGate.fetchImpl = async () => {
+    secondRan = true;
+    return new Response("ok", { status: 200 });
+  };
+
+  const res2 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "2",
+    })
+  );
+  assert.equal(res2.status, 200);
+  await res2.text();
+  assert.ok(secondRan, "Queue must not deadlock after stream idle timeout");
+});
+
+test("T3: Client cancellation during streaming aborts upstream and releases queue", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let upstreamCancelled = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      const stream = new ReadableStream({
+        pull(controller) {
+          controller.enqueue(new TextEncoder().encode("chunk-1"));
+        },
+        cancel() {
+          upstreamCancelled = true;
+        },
+      });
+      return new Response(stream, { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res1 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "1",
+    })
+  );
+
+  assert.equal(res1.status, 200);
+  const reader = res1.body.getReader();
+  const chunk1 = await reader.read();
+  assert.equal(new TextDecoder().decode(chunk1.value), "chunk-1");
+
+  // Client cancels reading stream
+  await reader.cancel("Client navigated away");
+  assert.ok(upstreamCancelled, "Cancellation must propagate to upstream");
+
+  // Queue must be open for next request
+  rateGate.fetchImpl = async () => new Response("ok-2", { status: 200 });
+  const res2 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "2",
+    })
+  );
+  assert.equal(res2.status, 200);
+  await res2.text();
+});
+
+test("T1/T3: Strict FIFO ordering under concurrent requests", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const executionOrder = [];
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async (url, opts) => {
+      const id = opts.headers.get("x-req-id");
+      executionOrder.push(id);
+      await new Promise((r) => setTimeout(r, 5));
+      return new Response(JSON.stringify({ id }), { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  const reqPromises = [1, 2, 3, 4, 5].map(async (id) => {
+    const res = await rateGate.fetch(
+      new Request("https://proxy.internal/v1/chat/completions", {
+        method: "POST",
+        headers: { "x-req-id": String(id) },
+        body: JSON.stringify({ id }),
+      })
+    );
+    await res.text();
+  });
+
+  await Promise.all(reqPromises);
+  assert.deepEqual(
+    executionOrder,
+    ["1", "2", "3", "4", "5"],
+    "Requests must execute in strict FIFO order"
+  );
+});
+
+
+// ==========================================
+// BATCH 1F REGRESSION TESTS (F1 - F5)
+// ==========================================
+
+test("F1: Stream idle timeout triggers when client pauses reading between chunks", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let upstreamReaderCancelled = false;
+  let chunkCount = 0;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    STREAM_IDLE_TIMEOUT_MS: 40,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async (url, opts) => {
+      const stream = new ReadableStream({
+        pull(controller) {
+          chunkCount++;
+          controller.enqueue(new TextEncoder().encode(`chunk-${chunkCount}`));
+        },
+        cancel() {
+          upstreamReaderCancelled = true;
+        },
+      });
+      return new Response(stream, { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res1 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+
+  assert.equal(res1.status, 200);
+  const reader = res1.body.getReader();
+
+  // Read first chunk successfully
+  const chunk1 = await reader.read();
+  assert.equal(new TextDecoder().decode(chunk1.value), "chunk-1");
+
+  // Client deliberately pauses and does not read next chunk.
+  // Wait for stream idle timeout (40ms) + margin
+  await new Promise((r) => setTimeout(r, 60));
+
+  // Upstream reader must have been cancelled
+  assert.ok(upstreamReaderCancelled, "Upstream reader must be cancelled when client pauses between chunks");
+
+  // Subsequent read on the consumer side must reject with stream idle timeout
+  await assert.rejects(
+    async () => {
+      await reader.read();
+    },
+    (err) => err.message.includes("Stream idle timeout")
+  );
+
+  // Next queued request must be able to execute without deadlock
+  rateGate.fetchImpl = async () => new Response("unblocked", { status: 200 });
+  const res2 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+  assert.equal(res2.status, 200);
+  assert.equal(await res2.text(), "unblocked");
+});
+
+test("F2: Delayed incoming request body read does not hold exclusive queue slot", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const executionLog = [];
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async (url, opts) => {
+      const tag = opts.headers.get("x-tag");
+      executionLog.push(`dispatched-${tag}`);
+      return new Response(JSON.stringify({ ok: true, tag }), { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Request 1: Slow incoming body (takes 60ms to read)
+  const slowStream = new ReadableStream({
+    async start(controller) {
+      await new Promise((r) => setTimeout(r, 60));
+      controller.enqueue(new TextEncoder().encode("slow body chunk"));
+      controller.close();
+    },
+  });
+
+  const slowReq = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: { "x-tag": "slow", "content-type": "text/plain" },
+    body: slowStream,
+    duplex: "half",
+  });
+
+  const pSlow = rateGate.fetch(slowReq);
+
+  // Request 2 arrives 10ms later with an instant body
+  await new Promise((r) => setTimeout(r, 10));
+
+  const fastReq = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: { "x-tag": "fast" },
+    body: "instant",
+  });
+
+  const resFast = await rateGate.fetch(fastReq);
+  assert.equal(resFast.status, 200);
+  await resFast.text();
+
+  const resSlow = await pSlow;
+  assert.equal(resSlow.status, 200);
+  await resSlow.text();
+
+  // Fast request must have dispatched BEFORE slow request because slow request
+  // did not acquire the slot while reading its incoming body!
+  assert.deepEqual(
+    executionLog,
+    ["dispatched-fast", "dispatched-slow"],
+    "Fast request must acquire slot and dispatch before slow request completes its body read"
+  );
+});
+
+test("F3: Non-settling upstream cancellation fails closed and prevents overlapping requests", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let op2Dispatched = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    MAX_QUEUE_WAIT_MS: 50, // Queue wait limit
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async (url, opts) => {
+      const tag = opts.headers.get("x-tag");
+      if (tag === "op1") {
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("chunk-1"));
+          },
+          cancel() {
+            // Hanging cancellation promise that never settles!
+            return new Promise(() => {});
+          },
+        });
+        return new Response(stream, { status: 200 });
+      }
+      if (tag === "op2") {
+        op2Dispatched = true;
+        return new Response("ok-2", { status: 200 });
+      }
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Request 1 starts streaming
+  const res1 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-tag": "op1" },
+      body: "{}",
+    })
+  );
+
+  const reader1 = res1.body.getReader();
+  await reader1.read();
+
+  // Client cancels stream -> triggers cancel() on upstream which never settles
+  reader1.cancel("client abort");
+
+  // Request 2 arrives and waits in queue
+  const res2 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-tag": "op2" },
+      body: "{}",
+    })
+  );
+
+  // Request 2 must NOT be dispatched while upstream cancellation is unsettled (fail-closed!)
+  assert.equal(
+    op2Dispatched,
+    false,
+    "Op 2 must NEVER be dispatched to upstream while Op 1 cancellation is unsettled"
+  );
+  assert.equal(
+    res2.status,
+    503,
+    "Request 2 must time out in queue with 503 rather than sending overlapping request"
+  );
+});
+
+test("F3: Upstream cancellation shutdown delay prevents overlapping dispatch to next request", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let op1Active = false;
+  let overlapDetected = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async (url, opts) => {
+      const tag = opts.headers.get("x-tag");
+      if (tag === "op1") {
+        op1Active = true;
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("chunk-1"));
+          },
+          async cancel() {
+            // Upstream takes 30ms to cleanly terminate connection
+            await new Promise((r) => setTimeout(r, 30));
+            op1Active = false;
+          },
+        });
+        return new Response(stream, { status: 200 });
+      } else {
+        if (op1Active) {
+          overlapDetected = true;
+        }
+        return new Response("ok-2", { status: 200 });
+      }
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  const res1 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-tag": "op1" },
+      body: "{}",
+    })
+  );
+
+  const reader1 = res1.body.getReader();
+  await reader1.read();
+
+  // Trigger cancel on op1
+  const cancelPromise = reader1.cancel();
+
+  // Concurrently request op2
+  const p2 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-tag": "op2" },
+      body: "{}",
+    })
+  );
+
+  const [_, res2] = await Promise.all([cancelPromise, p2]);
+  assert.equal(res2.status, 200);
+  await res2.text();
+  assert.equal(
+    overlapDetected,
+    false,
+    "Op 2 must not dispatch while Op 1 cancellation shutdown is in progress"
+  );
+});
+
+test("F4: MAX_QUEUE_DEPTH = 0 allows 1 active request and rejects all waiting requests with 503", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let unblockFirst;
+  const firstBlock = new Promise((resolve) => {
+    unblockFirst = resolve;
+  });
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 1500,
+    MAX_QUEUE_DEPTH: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      await firstBlock;
+      return new Response("ok-1", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Request 1: active request
+  const p1 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "1",
+    })
+  );
+
+  // Yield to allow Request 1 to become active
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Request 2 arrives while Request 1 is active: queue depth is 0 -> immediately 503
+  const res2 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "2",
+    })
+  );
+
+  assert.equal(res2.status, 503);
+  assert.equal(res2.headers.get("Retry-After"), "2");
+  const data2 = await res2.json();
+  assert.equal(data2.error, "Queue depth exceeded");
+
+  // Unblock and complete request 1
+  unblockFirst();
+  const res1 = await p1;
+  assert.equal(res1.status, 200);
+  await res1.text();
+
+  // Request 3 arrives when queue is idle: must succeed with 200
+  rateGate.fetchImpl = async () => new Response("ok-3", { status: 200 });
+  const res3 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "3",
+    })
+  );
+  assert.equal(res3.status, 200);
+  assert.equal(await res3.text(), "ok-3");
+});
+
+test("F4: MAX_QUEUE_DEPTH = 1 allows 1 active and 1 waiting, rejecting 3rd request with 503", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let unblockFirst;
+  const firstBlock = new Promise((resolve) => {
+    unblockFirst = resolve;
+  });
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 1500,
+    MAX_QUEUE_DEPTH: 1,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async (url, opts) => {
+      const id = opts.headers.get("x-id");
+      if (id === "1") {
+        await firstBlock;
+      }
+      return new Response(`ok-${id}`, { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Request 1: becomes active
+  const p1 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-id": "1" },
+      body: "1",
+    })
+  );
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Request 2: admitted into backlog queue (depth 1)
+  const p2 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-id": "2" },
+      body: "2",
+    })
+  );
+
+  // Request 3: backlog full -> rejected immediately with 503
+  const res3 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-id": "3" },
+      body: "3",
+    })
+  );
+
+  assert.equal(res3.status, 503);
+  assert.equal(res3.headers.get("Retry-After"), "2");
+
+  // Unblock request 1
+  unblockFirst();
+  const res1 = await p1;
+  assert.equal(res1.status, 200);
+  await res1.text();
+
+  const res2 = await p2;
+  assert.equal(res2.status, 200);
+  await res2.text();
+});
+
+test("F5: Sliding window exact 60,999ms vs 61,000ms boundary behavior", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  // Populate state with 1 request at t = 1,000ms
+  await ctx.storage.put("rate-state", {
+    starts: [1000],
+    lastSendAt: 1000,
+    lastCompletionAt: 1500,
+  });
+
+  const env = {
+    RPM: 1, // Limit: 1 request per 60,000ms
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Case A: At t = 60,999ms (59,999ms elapsed since t = 1,000ms)
+  // Window has 1ms left! Must sleep for 1ms.
+  clock.currentTime = 60_999;
+  clock.sleepCalls = [];
+
+  const resA = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+  await resA.text();
+
+  assert.equal(clock.sleepCalls.length, 1, "Must sleep when at 60,999ms (1ms before expiration)");
+  assert.equal(clock.sleepCalls[0].ms, 1, "Must wait exactly 1ms to reach 61,000ms window boundary");
+
+  // Reset state for Case B: 1 request at t = 61,000ms
+  await ctx.storage.put("rate-state", {
+    starts: [61_000],
+    lastSendAt: 61_000,
+    lastCompletionAt: 61_500,
+  });
+
+  // Case B: At t = 121,000ms (exactly 60,000ms elapsed since t = 61,000ms)
+  // Window has expired (121,000 - 61,000 >= 60,000). Must not sleep!
+  clock.currentTime = 121_000;
+  clock.sleepCalls = [];
+
+  const resB = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+  await resB.text();
+
+  assert.equal(clock.sleepCalls.length, 0, "Must not sleep when at exactly 61,000ms after start (expired)");
+});
+
+test("F5: Client request.signal abort during active streaming propagates upstream and releases slot", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let upstreamCancelled = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      const stream = new ReadableStream({
+        pull(controller) {
+          controller.enqueue(new TextEncoder().encode("chunk-data"));
+        },
+        cancel() {
+          upstreamCancelled = true;
+        },
+      });
+      return new Response(stream, { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const abortCtrl = new AbortController();
+
+  const res1 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "1",
+      signal: abortCtrl.signal,
+    })
+  );
+
+  assert.equal(res1.status, 200);
+  const reader = res1.body.getReader();
+  const chunk = await reader.read();
+  assert.equal(new TextDecoder().decode(chunk.value), "chunk-data");
+
+  // Abort client request signal
+  abortCtrl.abort();
+
+  // Allow abort handler to execute
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(upstreamCancelled, "Client request abort must propagate to upstream stream");
+
+  // Next request must execute cleanly
+  rateGate.fetchImpl = async () => new Response("ok-2", { status: 200 });
+  const res2 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "2",
+    })
+  );
+  assert.equal(res2.status, 200);
+  assert.equal(await res2.text(), "ok-2");
+});

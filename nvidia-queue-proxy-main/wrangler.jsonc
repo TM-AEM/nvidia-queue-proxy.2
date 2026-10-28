@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nvidia-queue-proxy",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-27",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "RATE_GATE",
+        "class_name": "RateGate"
+      }
+    ]
+  },
+  "exports": {
+    "RateGate": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
