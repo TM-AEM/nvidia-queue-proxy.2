@@ -573,7 +573,12 @@ export function parseRetryAfterMs(response, now = Date.now()) {
   const seconds = Number(trimmed);
 
   if (!Number.isNaN(seconds)) {
-    if (seconds <= 0) return 0;
+    // RFC 7231 / RFC 9110 §10.2.3: delay-seconds = 1*DIGIT
+    // Non-negative integer seconds only; reject fractional seconds or negative numbers
+    if (trimmed.includes(".") || seconds < 0) {
+      return null;
+    }
+    if (seconds === 0) return 0;
     const ms = seconds * 1000;
     return Number.isFinite(ms) ? Math.round(ms) : Infinity;
   }
@@ -950,10 +955,28 @@ export class RateGate extends DurableObject {
     let declaredBytes = 0;
     const clHeader = request.headers.get("content-length");
     if (clHeader !== null) {
-      const n = Number(clHeader);
-      if (Number.isFinite(n) && n > 0) {
-        declaredBytes = n;
+      const trimmed = clHeader.trim();
+      if (!/^\d+$/.test(trimmed)) {
+        return Response.json(
+          { error: "Invalid Content-Length header" },
+          { status: 400 }
+        );
       }
+      const n = Number(trimmed);
+      if (!Number.isSafeInteger(n)) {
+        return Response.json(
+          { error: "Invalid Content-Length header" },
+          { status: 400 }
+        );
+      }
+      declaredBytes = n;
+    }
+
+    if (declaredBytes > maxBodyBytes) {
+      return Response.json(
+        { error: "Request body too large" },
+        { status: 413 }
+      );
     }
 
     if (
@@ -979,6 +1002,7 @@ export class RateGate extends DurableObject {
     }
 
     let allocatedBytes = declaredBytes;
+    let totalReadBytes = 0;
     if (hasBodyStream) {
       this.activeBodyReads++;
       this.activeBodyBytes += allocatedBytes;
@@ -995,12 +1019,14 @@ export class RateGate extends DurableObject {
           setTimeoutImpl: this.setTimeoutImpl,
           clearTimeoutImpl: this.clearTimeoutImpl,
           onChunk: (chunkBytes) => {
-            if (declaredBytes === 0) {
-              this.activeBodyBytes += chunkBytes;
-              allocatedBytes += chunkBytes;
-              if (this.activeBodyBytes > maxAggregateBodyBytes) {
+            totalReadBytes += chunkBytes;
+            if (totalReadBytes > allocatedBytes) {
+              const delta = totalReadBytes - allocatedBytes;
+              if (this.activeBodyBytes + delta > maxAggregateBodyBytes) {
                 throw new AggregateBodyLimitExceededError();
               }
+              this.activeBodyBytes += delta;
+              allocatedBytes += delta;
             }
           },
         }

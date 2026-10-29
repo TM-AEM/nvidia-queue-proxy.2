@@ -347,9 +347,10 @@ test("T2: retryAfterMs parses absent, numeric, date-form, and malformed values",
     retryAfterMs(new Response("ok", { headers: { "Retry-After": "5" } }), baseTime),
     5000
   );
+  // Fractional numeric value -> invalid per RFC 7231 -> 0 (fall back to backoff)
   assert.equal(
     retryAfterMs(new Response("ok", { headers: { "Retry-After": "1.5" } }), baseTime),
-    1500
+    0
   );
   assert.equal(
     retryAfterMs(new Response("ok", { headers: { "Retry-After": " 10  " } }), baseTime),
@@ -3749,10 +3750,10 @@ test("AUDIT-05: parseRetryAfterMs parses numeric and HTTP-date forms", () => {
   assert.equal(parseRetryAfterMs(mk("NaN"), baseTime), null);
 
   assert.equal(parseRetryAfterMs(mk("0"), baseTime), 0);
-  assert.equal(parseRetryAfterMs(mk("-5"), baseTime), 0);
+  assert.equal(parseRetryAfterMs(mk("-5"), baseTime), null);
   assert.equal(parseRetryAfterMs(mk("5"), baseTime), 5000);
   assert.equal(parseRetryAfterMs(mk("60"), baseTime), 60_000);
-  assert.equal(parseRetryAfterMs(mk("1.5"), baseTime), 1500);
+  assert.equal(parseRetryAfterMs(mk("1.5"), baseTime), null, "fractional seconds must return null per RFC 7231");
   assert.equal(parseRetryAfterMs(mk("1e400"), baseTime), Infinity);
 
   const future = new Date(baseTime + 15_000).toUTCString();
@@ -3837,4 +3838,196 @@ test("AUDIT-05: 429 with Retry-After <= MAX_BACKOFF_MS retries after requested d
   assert.equal(attempts, 2);
   assert.equal(clock.sleepCalls.length, 1);
   assert.equal(clock.sleepCalls[0].ms, 5000, "delay must equal the 5s Retry-After floor");
+});
+
+test("AUDIT-05: 429 with fractional Retry-After falls back to exponential backoff", async () => {
+  const clock = new FakeClock(10_000);
+  const ctx = createMockCtx();
+  let attempts = 0;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __random: () => 0, // Zero jitter
+    __fetch: async () => {
+      attempts++;
+      if (attempts === 1) {
+        return new Response("429", {
+          status: 429,
+          headers: { "Retry-After": "1.5" },
+        });
+      }
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(attempts, 2);
+  assert.equal(clock.sleepCalls.length, 1);
+  // Retry 0 base delay is 1000ms (baseDelayMs * 2^0)
+  assert.equal(clock.sleepCalls[0].ms, 1000, "fractional delay must fall back to exponential backoff");
+});
+
+test("AUDIT-01: invalid Content-Length header is rejected with 400 Bad Request", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  const invalidLengths = ["-5", "abc", "1.5", "", "   ", "10, 10"];
+  for (const bad of invalidLengths) {
+    const res = await rateGate.fetch(
+      new Request("https://proxy.internal/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-length": bad },
+        body: "{}",
+      })
+    );
+    assert.equal(res.status, 400, `Content-Length: ${bad} must be rejected with 400`);
+    const data = await res.json();
+    assert.equal(data.error, "Invalid Content-Length header");
+  }
+
+  assert.equal(rateGate.activeBodyReads, 0, "counters must remain 0");
+  assert.equal(rateGate.activeBodyBytes, 0, "counters must remain 0");
+});
+
+test("AUDIT-01: declared Content-Length > MAX_BODY_BYTES returns 413 immediately without reserving memory", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 1024,
+    MAX_AGGREGATE_BODY_BYTES: 4096,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "2048" },
+      body: "x",
+    })
+  );
+
+  assert.equal(res.status, 413);
+  const data = await res.json();
+  assert.equal(data.error, "Request body too large");
+  assert.equal(rateGate.activeBodyReads, 0);
+  assert.equal(rateGate.activeBodyBytes, 0);
+});
+
+test("AUDIT-01: understated Content-Length dynamically reserves memory and rejects when aggregate limit is exceeded", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 10 * 1024, // 10 KiB max per request
+    MAX_AGGREGATE_BODY_BYTES: 1024, // 1 KiB aggregate limit
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Client claims Content-Length is only 10 bytes, but actually streams 2000 bytes
+  const stream = new ReadableStream({
+    start(controller) {
+      // Chunk 1: 500 bytes (within aggregate limit of 1024)
+      controller.enqueue(new Uint8Array(500));
+      // Chunk 2: 600 bytes (exceeds aggregate limit: 500 + 600 = 1100 > 1024)
+      controller.enqueue(new Uint8Array(600));
+      controller.close();
+    },
+  });
+
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "10" },
+      body: stream,
+      duplex: "half",
+    })
+  );
+
+  assert.equal(res.status, 503);
+  const data = await res.json();
+  assert.equal(data.error, "Too many concurrent uploads, please retry later");
+  // Clean decrement on failure:
+  assert.equal(rateGate.activeBodyReads, 0, "activeBodyReads must be restored to 0");
+  assert.equal(rateGate.activeBodyBytes, 0, "activeBodyBytes must be restored to 0");
+});
+
+test("AUDIT-02: upstream reader.cancel rejection is caught cleanly and releases queue slot", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("chunk-1"));
+        },
+        cancel() {
+          // Rejection during cancel
+          return Promise.reject(new Error("socket destroyed"));
+        },
+      });
+      return new Response(stream, { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  const res1 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+
+  const reader1 = res1.body.getReader();
+  await reader1.read();
+
+  // Cancel stream, triggering upstream reader.cancel() rejection
+  await reader1.cancel("client abort");
+
+  // Slot should be cleanly released without unhandled rejection
+  assert.equal(rateGate.activeTicket, null, "slot must be released cleanly after cancel rejection");
 });
