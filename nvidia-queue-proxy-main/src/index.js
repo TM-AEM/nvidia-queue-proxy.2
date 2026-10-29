@@ -1661,8 +1661,22 @@ export class RateGate extends DurableObject {
             request.signal.removeEventListener("abort", onClientAbort);
           }
 
+          // Persisting the final rate state is best-effort: it only informs the
+          // next request's cooldown/window starting point, and `rate-state` is
+          // re-read from storage at the start of every request. A storage write
+          // failure here must NEVER prevent the concurrency-slot release below,
+          // otherwise a single transient persistence error would leave the
+          // single slot held for the lifetime of the instance (F-01). The error
+          // is contained so it cannot surface as an unhandled rejection or
+          // change the HTTP response contract.
           state.lastCompletionAt = this.getNow();
-          await this.ctx.storage.put("rate-state", state);
+
+          try {
+            await this.ctx.storage.put("rate-state", state);
+          } catch {
+            // Intentionally swallowed: see above. Slot release is unconditional
+            // with respect to this optional write.
+          }
         }
 
         // Release the concurrency slot only if upstream termination was

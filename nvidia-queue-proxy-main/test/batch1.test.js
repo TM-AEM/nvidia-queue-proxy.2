@@ -5863,3 +5863,174 @@ test("AUDIT-10: a streaming successful response releases the request-body reserv
 
   assert.equal(await res.text(), "data: a\n\n");
 });
+
+// ==========================================
+// AUDIT-17 / F-01 — slot release must survive a storage-write failure in the
+// streaming finish() cleanup
+// ==========================================
+//
+// The normal streaming-completion path invokes finish() exactly once. finish()
+// persists `rate-state` and only then releases the concurrency slot. If that
+// persistence write rejects, the original implementation exited before the
+// release, leaving the single slot held forever for the instance. This test
+// injects a storage failure on the completion write only (the initial
+// per-attempt write still succeeds) and asserts the slot is nevertheless
+// released and the next request reaches the upstream.
+function makeVaultCtx() {
+  const store = new Map();
+  let putCount = 0;
+  let failAtPut = Infinity;
+
+  return {
+    storage: {
+      async get(key) {
+        if (!store.has(key)) return undefined;
+        return JSON.parse(JSON.stringify(store.get(key)));
+      },
+      async put(key, value) {
+        putCount += 1;
+        if (putCount === failAtPut) {
+          throw new Error("simulated storage write failure");
+        }
+        store.set(key, JSON.parse(JSON.stringify(value)));
+      },
+    },
+    // Fails exactly the (1-based) nth put call, then succeeds for later puts.
+    failPutAt(n) {
+      failAtPut = n;
+    },
+    get putCount() {
+      return putCount;
+    },
+  };
+}
+
+function streamingUpstream(counter) {
+  return async () => {
+    counter.calls += 1;
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("data: a\n\n"));
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } }
+    );
+  };
+}
+
+test("AUDIT-17/F-01: a storage write failure during streaming finish() still releases the queue slot", async () => {
+  const clock = new FakeClock(0);
+  const ctx = makeVaultCtx();
+  const counter = { calls: 0 };
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    MAX_QUEUE_WAIT_MS: 1000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: streamingUpstream(counter),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  let releaseCount = 0;
+  const originalRelease = rateGate.releaseSlot.bind(rateGate);
+  rateGate.releaseSlot = () => {
+    releaseCount += 1;
+    return originalRelease();
+  };
+
+  // Track unhandled rejections created by the injected failure.
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+
+  try {
+    // Put #1 is the per-attempt rate-state write before dispatch; it must
+    // succeed so the request proceeds to the upstream. Put #2 is the
+    // completion write inside finish(); fail exactly that one to trigger F-01.
+    ctx.failPutAt(2);
+
+    const res1 = await rateGate.fetch(chatRequest());
+    assert.equal(res1.status, 200, "the first (streaming) response must succeed");
+
+    // Consume the stream to its normal terminal state. finish() runs here.
+    assert.equal(await res1.text(), "data: a\n\n");
+    // Let any queued microtasks (finish() is async) settle deterministically.
+    await tick();
+
+    assert.equal(
+      releaseCount,
+      1,
+      "the slot must be released exactly once despite the storage failure"
+    );
+    assert.equal(
+      rateGate.activeTicket,
+      null,
+      "the queue slot must be free after streaming completes"
+    );
+
+    // A second request must reach the upstream rather than waiting for the
+    // queue timeout (the original defect returned 503 here).
+    const res2 = await rateGate.fetch(chatRequest());
+    assert.equal(
+      res2.status,
+      200,
+      "the next request must be dispatched, not rejected with 503"
+    );
+    assert.equal(
+      counter.calls,
+      2,
+      "the second request must actually reach the upstream"
+    );
+    assert.equal(await res2.text(), "data: a\n\n");
+
+    assert.equal(
+      releaseCount,
+      2,
+      "each completed request releases the slot exactly once"
+    );
+
+    await tick();
+    assert.equal(
+      unhandled.length,
+      0,
+      "the persistence failure must not create an unhandled rejection"
+    );
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+  }
+});
+
+test("AUDIT-17/F-01 control: the normal streaming completion path still releases the slot", async () => {
+  const clock = new FakeClock(0);
+  const ctx = makeVaultCtx();
+  const counter = { calls: 0 };
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    MAX_QUEUE_WAIT_MS: 1000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: streamingUpstream(counter),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  const res1 = await rateGate.fetch(chatRequest());
+  assert.equal(res1.status, 200);
+  assert.equal(await res1.text(), "data: a\n\n");
+  await tick();
+
+  assert.equal(rateGate.activeTicket, null, "the slot is free without a failure");
+  assert.ok(ctx.putCount >= 1, "the completion write was attempted");
+
+  const res2 = await rateGate.fetch(chatRequest());
+  assert.equal(res2.status, 200);
+  assert.equal(counter.calls, 2, "the second request reaches the upstream");
+  assert.equal(await res2.text(), "data: a\n\n");
+});
