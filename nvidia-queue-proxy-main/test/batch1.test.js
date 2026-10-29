@@ -23,6 +23,7 @@ const {
   RateGate,
   retryAfterMs,
   computeBackoffDelay,
+  applyBackoffJitter,
   safeResponseHeaders,
   readConfigValue,
   resolveConfig,
@@ -2805,4 +2806,771 @@ test("NQP-02: injected env.__fetch seam is still honored", async () => {
   assert.equal(res.status, 200);
   assert.equal(called, true, "env.__fetch must be used when provided");
   assert.equal(await res.text(), "injected");
+});
+
+// ==========================================
+// NQP-RL-02: Rate-limiter regression tests
+// ==========================================
+// Direct evidence that RateGate enforces: (1) a minimum interval between
+// consecutive upstream starts equal to the cooldown, (2) the sliding-window
+// request limit at its 60s boundary, (3) strict one-at-a-time upstream
+// serialization, and (4) that queued requests and 429 retries cannot bypass the
+// limiter. All timing is driven by the injectable FakeClock / deferred upstream
+// (no real sleeps, no network, no NVIDIA credentials).
+
+const RL_COOLDOWN_MS = 1_670;
+const RL_WINDOW_MS = 60_000;
+
+test("NQP-RL-02: consecutive upstream starts are spaced by at least the cooldown", async () => {
+  const clock = new FakeClock(1_000_000);
+  const ctx = createMockCtx();
+  const starts = [];
+  const env = {
+    RPM: 40,
+    COOLDOWN_MS: RL_COOLDOWN_MS,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      starts.push(clock.now());
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+  const count = 5;
+
+  await Promise.all(
+    Array.from({ length: count }, (_, i) =>
+      rateGate
+        .fetch(
+          new Request("https://proxy.internal/v1/chat/completions", {
+            method: "POST",
+            headers: { "x-req-id": String(i) },
+            body: "{}",
+          })
+        )
+        .then((res) => res.text())
+    )
+  );
+
+  assert.equal(starts.length, count, "every queued request must reach the upstream");
+  const ordered = [...starts].sort((a, b) => a - b);
+  const gaps = ordered.slice(1).map((t, i) => t - ordered[i]);
+
+  for (const gap of gaps) {
+    assert.ok(
+      gap >= RL_COOLDOWN_MS,
+      `consecutive upstream starts must be >= ${RL_COOLDOWN_MS}ms apart (got ${gap}ms)`
+    );
+  }
+  assert.deepEqual(
+    gaps,
+    [RL_COOLDOWN_MS, RL_COOLDOWN_MS, RL_COOLDOWN_MS, RL_COOLDOWN_MS],
+    "with the fake clock the spacing is exactly the cooldown (no extra padding)"
+  );
+});
+
+test("NQP-RL-02: sliding-window limit is enforced at the 60s boundary", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const starts = [];
+  const env = {
+    RPM: 3,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      starts.push(clock.now());
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+  const count = 6;
+
+  await Promise.all(
+    Array.from({ length: count }, (_, i) =>
+      rateGate
+        .fetch(
+          new Request("https://proxy.internal/v1/chat/completions", {
+            method: "POST",
+            headers: { "x-req-id": String(i) },
+            body: "{}",
+          })
+        )
+        .then((res) => res.text())
+    )
+  );
+
+  const ordered = [...starts].sort((a, b) => a - b);
+  assert.deepEqual(
+    ordered,
+    [0, 0, 0, RL_WINDOW_MS, RL_WINDOW_MS, RL_WINDOW_MS],
+    "the 4th request must wait for the oldest start to leave the 60s window"
+  );
+
+  for (const t of ordered) {
+    const inWindow = ordered.filter(
+      (x) => x >= t && x < t + RL_WINDOW_MS
+    ).length;
+    assert.ok(
+      inWindow <= 3,
+      `no 60s window may contain more than RPM=3 starts (found ${inWindow} at t=${t})`
+    );
+  }
+});
+
+test("NQP-RL-02: at most one upstream request is in flight at a time", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const releaseUpstream = [];
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    // Blocks until the test releases it, so overlap (if any) is directly observable.
+    __fetch: async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => releaseUpstream.push(resolve));
+      inFlight -= 1;
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+  const count = 5;
+
+  const waitFor = async (predicate, label) => {
+    for (let i = 0; i < 500; i++) {
+      if (predicate()) return;
+      await tick();
+    }
+    assert.fail(`Timed out waiting for ${label}`);
+  };
+
+  const settled = Array.from({ length: count }, (_, i) =>
+    rateGate
+      .fetch(
+        new Request("https://proxy.internal/v1/chat/completions", {
+          method: "POST",
+          headers: { "x-req-id": String(i) },
+          body: "{}",
+        })
+      )
+      .then((res) => res.text())
+  );
+
+  await waitFor(
+    () => releaseUpstream.length >= 1,
+    "the first upstream call to start"
+  );
+  assert.equal(
+    inFlight,
+    1,
+    "only one upstream call may be in flight while the rest wait"
+  );
+
+  for (let released = 0; released < count; released++) {
+    releaseUpstream[released]();
+    await waitFor(
+      () => released === count - 1 || releaseUpstream.length >= released + 2,
+      `upstream call ${released + 2} to start only after the previous resolves`
+    );
+  }
+
+  await Promise.all(settled);
+  assert.equal(maxInFlight, 1, "no two upstream calls may ever overlap");
+});
+
+test("NQP-RL-02: a 429 retry cannot bypass the cooldown between upstream attempts", async () => {
+  const clock = new FakeClock(1_000_000);
+  const ctx = createMockCtx();
+  const attemptTimes = [];
+  let attempt = 0;
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: RL_COOLDOWN_MS,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      attemptTimes.push(clock.now());
+      attempt += 1;
+      if (attempt === 1) {
+        // No Retry-After: the exponential backoff (1000ms) alone is below the
+        // cooldown, so the limiter must supply the remaining gap.
+        return new Response(JSON.stringify({ error: "rate limit" }), {
+          status: 429,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const rateGate = new RateGate(ctx, env);
+
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+  await res.text();
+
+  assert.equal(attemptTimes.length, 2, "one initial attempt plus one retry");
+  const gap = attemptTimes[1] - attemptTimes[0];
+  assert.ok(
+    gap >= RL_COOLDOWN_MS,
+    `the retry must wait at least the ${RL_COOLDOWN_MS}ms cooldown after the previous attempt (got ${gap}ms)`
+  );
+});
+
+
+// ==========================================
+// NQP-429 REGRESSION TESTS — Bounded upstream 429 bodies
+// ==========================================
+//
+// The upstream 429 (rate-limit) error body is read with a hard byte cap and a
+// hard time cap instead of an unbounded response.arrayBuffer(). These tests pin
+// the observable behavior of that bound: bodies up to the cap pass through
+// byte-for-byte, over-limit or unreadable bodies are replaced with a
+// deterministic synthetic JSON body, and every path (including stalled reads
+// and never-settling cancellations) still releases the queue slot and preserves
+// retry/cooldown/accounting semantics.
+//
+// MAX_429 mirrors MAX_429_BODY_BYTES in src/index.js (64 KiB). It is duplicated
+// here rather than imported because that source constant is intentionally not
+// exported: workerd's module format rejects non-function named exports, which
+// the Miniflare runtime test would otherwise fail on.
+const MAX_429 = 64 * 1024;
+const SYNTHETIC_429 = {
+  error: "Upstream rate-limit response body exceeded the proxy limit",
+};
+
+function make429Env(overrides = {}) {
+  const clock = new FakeClock(1_000);
+  const ctx = createMockCtx();
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    ...overrides,
+  };
+  return { clock, ctx, env };
+}
+
+function chatRequest(body = "{}") {
+  return new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    body,
+  });
+}
+
+test("NQP-429-01: a 429 response with an empty body is passed through unchanged", async () => {
+  const { ctx, env } = make429Env();
+  let attempts = 0;
+  env.__fetch = async () => {
+    attempts++;
+    return new Response("", { status: 429 });
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  assert.equal(await res.text(), "", "an empty upstream body must remain empty");
+  assert.equal(attempts, 6, "the existing retry limit must be preserved");
+  assert.equal(rateGate.activeTicket, null, "the queue slot must be released");
+});
+
+test("NQP-429-02: a 429 body smaller than the cap is forwarded byte-for-byte", async () => {
+  const { ctx, env } = make429Env();
+  const upstreamBody = "rate limit exceeded: please slow down";
+  env.__fetch = async () =>
+    new Response(upstreamBody, {
+      status: 429,
+      headers: { "content-type": "text/plain", "x-custom-upstream": "keep-me" },
+    });
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  assert.equal(res.headers.get("x-custom-upstream"), "keep-me", "safe headers must be preserved");
+  assert.equal(await res.text(), upstreamBody, "a sub-cap body must be forwarded exactly");
+  assert.equal(rateGate.activeTicket, null);
+});
+
+test("NQP-429-03: a 429 body exactly at the cap is forwarded byte-for-byte", async () => {
+  const { ctx, env } = make429Env();
+  const upstreamBody = "a".repeat(MAX_429);
+  env.__fetch = async () => new Response(upstreamBody, { status: 429 });
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  const text = await res.text();
+  assert.equal(text.length, MAX_429, "a body at the cap must be accepted in full");
+  assert.equal(text, upstreamBody);
+  assert.equal(rateGate.activeTicket, null);
+});
+
+test("NQP-429-04: a 429 body one byte over the cap is replaced with a synthetic body", async () => {
+  const { ctx, env } = make429Env();
+  const upstreamBody = "a".repeat(MAX_429 + 1);
+  env.__fetch = async () =>
+    new Response(upstreamBody, {
+      status: 429,
+      headers: { "x-custom-upstream": "keep-me" },
+    });
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  const text = await res.text();
+  assert.notEqual(text, upstreamBody, "the oversized upstream body must not be returned");
+  assert.deepEqual(
+    JSON.parse(text),
+    SYNTHETIC_429,
+    "a deterministic synthetic JSON body must be returned instead of a corrupt truncation"
+  );
+  assert.equal(res.headers.get("x-custom-upstream"), "keep-me", "safe headers must be preserved");
+  assert.equal(rateGate.activeTicket, null);
+});
+
+test("NQP-429-05: an effectively unbounded streamed 429 body is bounded and does not hang", async () => {
+  const { ctx, env } = make429Env();
+  let attempts = 0;
+  env.__fetch = async () => {
+    attempts++;
+    const stream = new ReadableStream({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(MAX_429)); // never ends
+      },
+    });
+    return new Response(stream, { status: 429 });
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  assert.deepEqual(JSON.parse(await res.text()), SYNTHETIC_429);
+  assert.equal(attempts, 6, "the retry limit must still be enforced");
+  assert.equal(rateGate.activeTicket, null);
+});
+
+test("NQP-429-06: a 429 body stream that stalls during reading is bounded and cancelled", async () => {
+  const timers = createFakeTimers();
+  const clock = new FakeClock(1_000);
+  const ctx = createMockCtx();
+  let attempts = 0;
+  let stalledCancelled = false;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => {
+      attempts++;
+      if (attempts === 1) {
+        const stream = new ReadableStream({
+          pull() {
+            /* never enqueues: stalls forever */
+          },
+          cancel() {
+            stalledCancelled = true;
+          },
+        });
+        return new Response(stream, { status: 429 });
+      }
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const resPromise = rateGate.fetch(chatRequest());
+  await tick();
+  timers.advance(30_000); // the 429-body read deadline fires
+  await tick();
+
+  const res = await resPromise;
+  assert.equal(res.status, 200, "the proxy must not hang on a stalled upstream read");
+  assert.equal(stalledCancelled, true, "the stalled upstream stream must be cancelled");
+  assert.equal(attempts, 2, "the stalled attempt must be abandoned and retried");
+  await res.text();
+  assert.equal(rateGate.activeTicket, null);
+});
+
+test("NQP-429-07: a 429 body whose cancellation never settles is cleaned up within the bounded grace", async () => {
+  const timers = createFakeTimers();
+  const clock = new FakeClock(1_000);
+  const ctx = createMockCtx();
+  let attempts = 0;
+  let cancelCalled = false;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => {
+      attempts++;
+      if (attempts === 1) {
+        const stream = new ReadableStream({
+          pull(controller) {
+            controller.enqueue(new Uint8Array(MAX_429 + 1)); // immediately over cap
+          },
+          cancel() {
+            cancelCalled = true;
+            return new Promise(() => {}); // never settles
+          },
+        });
+        return new Response(stream, { status: 429 });
+      }
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const resPromise = rateGate.fetch(chatRequest());
+  await tick();
+  await tick();
+  timers.advance(1_000); // DEFAULT_BODY_CANCEL_GRACE_MS
+  await tick();
+
+  const res = await resPromise;
+  assert.equal(cancelCalled, true, "cancellation must be attempted");
+  assert.equal(res.status, 200, "the proxy must not hang on a never-settling cancel");
+  assert.equal(attempts, 2);
+  await res.text();
+  assert.equal(rateGate.activeTicket, null);
+});
+
+test("NQP-429-08: a non-JSON 429 body below the cap is forwarded verbatim", async () => {
+  const { ctx, env } = make429Env();
+  const upstreamBody = "RATE LIMITED <<<not json>>> plain text";
+  env.__fetch = async () => new Response(upstreamBody, { status: 429 });
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  assert.equal(await res.text(), upstreamBody, "a non-JSON sub-cap body must be forwarded unchanged");
+  assert.equal(rateGate.activeTicket, null);
+});
+
+test("NQP-429-09: repeated 429 responses with bounded bodies still stop at the retry limit", async () => {
+  const { ctx, env } = make429Env();
+  let attempts = 0;
+  const upstreamBody = "slow down";
+  env.__fetch = async () => {
+    attempts++;
+    return new Response(upstreamBody, { status: 429 });
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(attempts, 6, "one initial attempt plus five retries");
+  assert.equal(res.status, 429);
+  assert.equal(await res.text(), upstreamBody, "the final bounded body must be returned");
+  assert.equal(rateGate.activeTicket, null);
+});
+
+test("NQP-429-10: a subsequent queued request succeeds after the bounded-body failure path", async () => {
+  const { ctx, env } = make429Env();
+  let calls = 0;
+  const oversized = "a".repeat(MAX_429 + 1);
+  env.__fetch = async () => {
+    calls++;
+    if (calls <= 6) return new Response(oversized, { status: 429 });
+    return new Response("ok", { status: 200 });
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const p1 = rateGate.fetch(chatRequest("1"));
+  const p2 = rateGate.fetch(chatRequest("2"));
+
+  const [r1, r2] = await Promise.all([p1, p2]);
+  assert.equal(r1.status, 429);
+  assert.deepEqual(JSON.parse(await r1.text()), SYNTHETIC_429);
+  assert.equal(r2.status, 200);
+  assert.equal(await r2.text(), "ok", "the queued request must succeed after the failure path");
+  assert.equal(rateGate.activeTicket, null);
+});
+
+test("NQP-429-11: attempt accounting and cooldown are preserved for bounded 429 bodies", async () => {
+  const RL_COOLDOWN_MS = 1_670;
+  const clock = new FakeClock(1_000);
+  const ctx = createMockCtx();
+  const attemptTimes = [];
+  const oversized = "a".repeat(MAX_429 + 1);
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: RL_COOLDOWN_MS,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      attemptTimes.push(clock.now());
+      return new Response(oversized, { status: 429 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+  assert.equal(res.status, 429);
+  await res.text();
+
+  const state = await ctx.storage.get("rate-state");
+  assert.equal(state.starts.length, 6, "every attempt including retries must be counted");
+  for (let i = 1; i < attemptTimes.length; i++) {
+    const gap = attemptTimes[i] - attemptTimes[i - 1];
+    assert.ok(
+      gap >= RL_COOLDOWN_MS,
+      `attempt ${i} must be at least the ${RL_COOLDOWN_MS}ms cooldown after the previous one (got ${gap}ms)`
+    );
+  }
+  assert.equal(rateGate.activeTicket, null);
+});
+
+test("NQP-429-12: no overlapping upstream requests while handling 429 bodies", async () => {
+  const { ctx, env } = make429Env();
+  let calls = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+
+  env.__fetch = async () => {
+    calls++;
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    if (calls <= 6) {
+      const stream = new ReadableStream({
+        pull(controller) {
+          controller.enqueue(new Uint8Array(MAX_429 + 1));
+        },
+        cancel() {
+          inFlight--;
+        },
+      });
+      return new Response(stream, { status: 429 });
+    }
+    inFlight--;
+    return new Response("ok", { status: 200 });
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const [r1, r2] = await Promise.all([
+    rateGate.fetch(chatRequest("1")),
+    rateGate.fetch(chatRequest("2")),
+  ]);
+
+  assert.equal(r1.status, 429);
+  await r1.text();
+  assert.equal(r2.status, 200);
+  await r2.text();
+
+  assert.equal(maxInFlight, 1, "at most one upstream request may be in flight at a time");
+  assert.equal(calls, 7, "six attempts for the first request plus one for the second");
+  assert.equal(rateGate.activeTicket, null);
+});
+
+
+// ==========================================
+// NQP-P2 REGRESSION TESTS — Retry-policy hardening (jitter + bounded Retry-After)
+// ==========================================
+//
+// NQP-P2-FINISH adds (a) an additive, bounded jitter band to the retry backoff
+// and (b) an explicit upper bound on Retry-After parsing. These tests pin both
+// behaviors with injected determinism (a fixed __random / random function) so
+// they never depend on wall-clock timing or real randomness.
+
+test("NQP-P2-01: applyBackoffJitter stays within [delay, maxBackoff] across the random domain", () => {
+  const maxBackoff = 30_000;
+
+  for (const delay of [1, 1000, 5000, 24_000, 30_000]) {
+    for (const r of [0, 0.25, 0.5, 0.999999, 1]) {
+      const out = applyBackoffJitter(delay, () => r, maxBackoff);
+
+      assert.ok(
+        out >= delay,
+        `jitter must never reduce the delay (delay=${delay}, r=${r}, out=${out})`
+      );
+      assert.ok(
+        out <= maxBackoff,
+        `jitter must never exceed the maximum (delay=${delay}, r=${r}, out=${out})`
+      );
+      assert.ok(
+        Number.isInteger(out),
+        `jitter must yield an integer millisecond delay (delay=${delay}, r=${r})`
+      );
+    }
+  }
+});
+
+test("NQP-P2-02: applyBackoffJitter is deterministic for injected randomness and preserves zero", () => {
+  assert.equal(applyBackoffJitter(8000, () => 0, 30_000), 8000, "zero random adds nothing");
+  assert.equal(applyBackoffJitter(8000, () => 1, 30_000), 10_000, "full random adds the 25% band");
+  assert.equal(applyBackoffJitter(30_000, () => 1, 30_000), 30_000, "a delay at the cap stays at the cap");
+  assert.equal(applyBackoffJitter(0, () => 1, 30_000), 0, "a zero delay must stay zero (no spurious delay)");
+});
+
+test("NQP-P2-03: jittered backoff never falls below a Retry-After minimum", () => {
+  const now = 100_000;
+  const resp = new Response("429", { headers: { "Retry-After": "10" } });
+
+  const floor = computeBackoffDelay(0, resp, {
+    now,
+    maxBackoffMs: 30_000,
+    jitterFn: (d) => applyBackoffJitter(d, () => 0, 30_000),
+  });
+  assert.equal(floor, 10_000, "with zero jitter the delay equals the Retry-After floor");
+
+  const ceiling = computeBackoffDelay(0, resp, {
+    now,
+    maxBackoffMs: 30_000,
+    jitterFn: (d) => applyBackoffJitter(d, () => 1, 30_000),
+  });
+  assert.equal(ceiling, 12_500, "jitter is applied on top of the Retry-After floor");
+  assert.ok(ceiling >= 10_000, "jitter must never drop below the server-requested Retry-After");
+});
+
+test("NQP-P2-04: retryAfterMs caps oversized and extreme values at the backoff maximum", () => {
+  const now = 1_000_000;
+  const mk = (v) => new Response("429", { headers: { "Retry-After": v } });
+
+  assert.equal(retryAfterMs(mk("999999999"), now), 30_000, "a huge seconds value is capped");
+  assert.equal(retryAfterMs(mk("1e400"), now), 30_000, "a non-finite seconds value is capped");
+  assert.equal(retryAfterMs(mk("1000000"), now), 30_000, "a very large seconds value is capped");
+  assert.equal(retryAfterMs(mk("5"), now), 5_000, "a valid small value is preserved exactly");
+  assert.equal(retryAfterMs(mk("999"), now, 5_000), 5_000, "a custom cap is honored");
+
+  const farFuture = new Date(now + 9_999_999_999).toUTCString();
+  assert.equal(retryAfterMs(mk(farFuture), now), 30_000, "a far-future HTTP-date is capped");
+});
+
+test("NQP-P2-05: the retry path applies jitter to backoff delays and counts each attempt", async () => {
+  const clock = new FakeClock(1_000);
+  const ctx = createMockCtx();
+  let attempts = 0;
+
+  const env = {
+    RPM: 1000,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __random: () => 1,
+    __fetch: async () => {
+      attempts++;
+      return new Response("", { status: 429 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  await res.text();
+
+  assert.equal(attempts, 6, "six attempts (initial + five retries)");
+  assert.deepEqual(
+    clock.sleepCalls.map((c) => c.ms),
+    [1250, 2500, 5000, 10_000, 20_000],
+    "each retry delay must include the additive 25% jitter band (deterministic __random = 1)"
+  );
+
+  const state = await ctx.storage.get("rate-state");
+  assert.equal(state.starts.length, 6, "every upstream attempt is counted exactly once");
+  assert.equal(rateGate.activeTicket, null, "the queue slot is released after retries are exhausted");
+});
+
+test("NQP-P2-06: an oversized Retry-After is capped at the callsite and never overflows", async () => {
+  const clock = new FakeClock(1_000);
+  const ctx = createMockCtx();
+
+  const env = {
+    RPM: 1000,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __random: () => 1,
+    __fetch: async () =>
+      new Response("", {
+        status: 429,
+        headers: { "Retry-After": "1000000000" },
+      }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  await res.text();
+
+  assert.equal(clock.sleepCalls.length, 5, "five backoff sleeps between six attempts");
+  for (const call of clock.sleepCalls) {
+    assert.equal(call.ms, 30_000, "a huge Retry-After is capped at the 30s backoff maximum");
+  }
+  assert.equal(rateGate.activeTicket, null, "the queue slot is released");
+});
+
+test("NQP-P3-01: applyBackoffJitter normalizes invalid random sources and stays within bounds", () => {
+  const maxBackoff = 30_000;
+  const delay = 8000;
+  const lo = delay;
+  const hi = maxBackoff;
+
+  // Invalid random sources must never yield a NaN/non-finite delay and must
+  // remain within [delay, maxBackoff]. The documented fallback is 1 (upper
+  // bound), so each of these produces delay + full 25% band = 10000.
+  for (const [label, value] of [
+    ["NaN", NaN],
+    ["undefined", undefined],
+    ["Infinity", Infinity],
+    ["-Infinity", -Infinity],
+    ["null", null],
+    ["negative", -0.5],
+    ["above one", 1.5],
+  ]) {
+    const out = applyBackoffJitter(delay, () => value, maxBackoff);
+
+    assert.ok(Number.isFinite(out), `random=${label} must produce a finite delay (got ${out})`);
+    assert.ok(out >= lo && out <= hi, `random=${label} must stay within [${lo}, ${hi}] (got ${out})`);
+    assert.equal(out, 10_000, `random=${label} must use the documented fallback of 1`);
+  }
+
+  // Valid lower and upper bounds must be used exactly.
+  assert.equal(applyBackoffJitter(delay, () => 0, maxBackoff), lo, "random=0 yields the base delay");
+  assert.equal(applyBackoffJitter(delay, () => 1, maxBackoff), 10_000, "random=1 yields the full band");
+
+  // The random source is sampled exactly once per call.
+  let calls = 0;
+  applyBackoffJitter(delay, () => {
+    calls++;
+    return 0.5;
+  }, maxBackoff);
+  assert.equal(calls, 1, "the injected random source must be called exactly once");
+
+  // Zero and cap semantics are preserved.
+  assert.equal(applyBackoffJitter(0, () => NaN, maxBackoff), 0, "a zero delay stays zero even with an invalid source");
+  assert.equal(applyBackoffJitter(maxBackoff, () => NaN, maxBackoff), maxBackoff, "a delay at the cap stays at the cap");
 });
