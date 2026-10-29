@@ -22,6 +22,7 @@ export async function resolve(specifier, context, nextResolve) {
 const {
   RateGate,
   retryAfterMs,
+  parseRetryAfterMs,
   computeBackoffDelay,
   applyBackoffJitter,
   safeResponseHeaders,
@@ -31,6 +32,7 @@ const {
   readBoundedBody,
   BodyTooLargeError,
   BodyReadTimeoutError,
+  AggregateBodyLimitExceededError,
 } = await import("../src/index.js");
 
 // ==========================================
@@ -3502,7 +3504,7 @@ test("NQP-P2-05: the retry path applies jitter to backoff delays and counts each
   assert.equal(rateGate.activeTicket, null, "the queue slot is released after retries are exhausted");
 });
 
-test("NQP-P2-06: an oversized Retry-After is capped at the callsite and never overflows", async () => {
+test("NQP-P2-06: an oversized Retry-After ceases retries immediately without retrying early", async () => {
   const clock = new FakeClock(1_000);
   const ctx = createMockCtx();
 
@@ -3524,12 +3526,14 @@ test("NQP-P2-06: an oversized Retry-After is capped at the callsite and never ov
   const res = await rateGate.fetch(chatRequest());
 
   assert.equal(res.status, 429);
+  assert.equal(res.headers.get("Retry-After"), "1000000000");
   await res.text();
 
-  assert.equal(clock.sleepCalls.length, 5, "five backoff sleeps between six attempts");
-  for (const call of clock.sleepCalls) {
-    assert.equal(call.ms, 30_000, "a huge Retry-After is capped at the 30s backoff maximum");
-  }
+  assert.equal(
+    clock.sleepCalls.length,
+    0,
+    "must not retry early when Retry-After exceeds MAX_BACKOFF_MS"
+  );
   assert.equal(rateGate.activeTicket, null, "the queue slot is released");
 });
 
@@ -3573,4 +3577,264 @@ test("NQP-P3-01: applyBackoffJitter normalizes invalid random sources and stays 
   // Zero and cap semantics are preserved.
   assert.equal(applyBackoffJitter(0, () => NaN, maxBackoff), 0, "a zero delay stays zero even with an invalid source");
   assert.equal(applyBackoffJitter(maxBackoff, () => NaN, maxBackoff), maxBackoff, "a delay at the cap stays at the cap");
+});
+
+// ==========================================
+// AUDIT-01: Bound Pre-Admission Request-Body Memory & Concurrency
+// ==========================================
+
+test("AUDIT-01: resolveConfig parses MAX_CONCURRENT_BODY_READS and MAX_AGGREGATE_BODY_BYTES", () => {
+  const defaults = resolveConfig({});
+  assert.equal(defaults.MAX_CONCURRENT_BODY_READS, 100);
+  assert.equal(defaults.MAX_AGGREGATE_BODY_BYTES, 32 * 1024 * 1024);
+
+  const custom = resolveConfig({
+    MAX_CONCURRENT_BODY_READS: "5",
+    MAX_AGGREGATE_BODY_BYTES: "16777216",
+  });
+  assert.equal(custom.MAX_CONCURRENT_BODY_READS, 5);
+  assert.equal(custom.MAX_AGGREGATE_BODY_BYTES, 16_777_216);
+
+  assert.throws(() => resolveConfig({ MAX_CONCURRENT_BODY_READS: 0 }), ConfigError);
+  assert.throws(() => resolveConfig({ MAX_CONCURRENT_BODY_READS: -1 }), ConfigError);
+  assert.throws(() => resolveConfig({ MAX_CONCURRENT_BODY_READS: "abc" }), ConfigError);
+  assert.throws(() => resolveConfig({ MAX_AGGREGATE_BODY_BYTES: 0 }), ConfigError);
+  assert.throws(() => resolveConfig({ MAX_AGGREGATE_BODY_BYTES: 500 }), ConfigError);
+  assert.throws(() => resolveConfig({ MAX_AGGREGATE_BODY_BYTES: 100 * 1024 * 1024 }), ConfigError);
+});
+
+test("AUDIT-01: saturated concurrency rejects excess upload with 503 and Retry-After", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 1670,
+    MAX_CONCURRENT_BODY_READS: 1,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  let unblockFirst;
+  const firstBlocker = new Promise((resolve) => {
+    unblockFirst = resolve;
+  });
+
+  const slowStream = new ReadableStream({
+    async start(controller) {
+      await firstBlocker;
+      controller.enqueue(new TextEncoder().encode("{}"));
+      controller.close();
+    },
+  });
+
+  // Request 1 starts reading and holds the single upload slot
+  const p1 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: slowStream,
+      duplex: "half",
+    })
+  );
+
+  await tick();
+
+  // Request 2 arrives while Request 1 is still reading -> rejected immediately
+  const res2 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+
+  assert.equal(res2.status, 503);
+  assert.equal(res2.headers.get("Retry-After"), "2");
+  const data2 = await res2.json();
+  assert.equal(data2.error, "Too many concurrent uploads, please retry later");
+
+  // Unblock request 1
+  unblockFirst();
+  const res1 = await p1;
+  assert.equal(res1.status, 200);
+  await res1.text();
+
+  // Once request 1 finishes, request 3 is admitted cleanly
+  const res3 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+  assert.equal(res3.status, 200);
+  await res3.text();
+});
+
+test("AUDIT-01: saturated aggregate memory rejects excess request with 503", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    MAX_AGGREGATE_BODY_BYTES: 1024, // 1 KiB aggregate limit for test
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Request with Content-Length larger than maxAggregateBodyBytes is rejected immediately
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "2048" },
+      body: "x",
+    })
+  );
+
+  assert.equal(res.status, 503);
+  const data = await res.json();
+  assert.equal(data.error, "Too many concurrent uploads, please retry later");
+  assert.equal(rateGate.activeBodyReads, 0, "activeBodyReads must remain 0");
+  assert.equal(rateGate.activeBodyBytes, 0, "activeBodyBytes must remain 0");
+});
+
+test("AUDIT-01: body read errors decrement active upload counters", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    MAX_BODY_BYTES: 100,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Oversized body triggers BodyTooLargeError (413)
+  const res413 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "x".repeat(200),
+    })
+  );
+  assert.equal(res413.status, 413);
+  assert.equal(rateGate.activeBodyReads, 0);
+  assert.equal(rateGate.activeBodyBytes, 0);
+});
+
+// ==========================================
+// AUDIT-05: Respect Upstream Retry-After Without Retrying Early
+// ==========================================
+
+test("AUDIT-05: parseRetryAfterMs parses numeric and HTTP-date forms", () => {
+  const baseTime = 1_000_000;
+  const mk = (v) => new Response("", { headers: { "Retry-After": v } });
+
+  assert.equal(parseRetryAfterMs(null, baseTime), null);
+  assert.equal(parseRetryAfterMs(new Response(""), baseTime), null);
+  assert.equal(parseRetryAfterMs(mk(""), baseTime), null);
+  assert.equal(parseRetryAfterMs(mk("   "), baseTime), null);
+  assert.equal(parseRetryAfterMs(mk("invalid"), baseTime), null);
+  assert.equal(parseRetryAfterMs(mk("NaN"), baseTime), null);
+
+  assert.equal(parseRetryAfterMs(mk("0"), baseTime), 0);
+  assert.equal(parseRetryAfterMs(mk("-5"), baseTime), 0);
+  assert.equal(parseRetryAfterMs(mk("5"), baseTime), 5000);
+  assert.equal(parseRetryAfterMs(mk("60"), baseTime), 60_000);
+  assert.equal(parseRetryAfterMs(mk("1.5"), baseTime), 1500);
+  assert.equal(parseRetryAfterMs(mk("1e400"), baseTime), Infinity);
+
+  const future = new Date(baseTime + 15_000).toUTCString();
+  assert.equal(parseRetryAfterMs(mk(future), baseTime), 15_000);
+
+  const past = new Date(baseTime - 5000).toUTCString();
+  assert.equal(parseRetryAfterMs(mk(past), baseTime), 0);
+});
+
+test("AUDIT-05: 429 with Retry-After > MAX_BACKOFF_MS returns 429 immediately with no early retry", async () => {
+  const clock = new FakeClock(10_000);
+  const ctx = createMockCtx();
+  let attempts = 0;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __random: () => 0,
+    __fetch: async () => {
+      attempts++;
+      return new Response(JSON.stringify({ error: "rate limit" }), {
+        status: 429,
+        headers: {
+          "Retry-After": "60",
+          "Content-Type": "application/json",
+        },
+      });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+
+  assert.equal(res.status, 429);
+  assert.equal(res.headers.get("Retry-After"), "60");
+  assert.equal(attempts, 1, "must not attempt automatic retries when Retry-After exceeds 30s");
+  assert.equal(clock.sleepCalls.length, 0, "must make zero sleep calls");
+  assert.equal(rateGate.activeTicket, null, "queue slot must be released");
+});
+
+test("AUDIT-05: 429 with Retry-After <= MAX_BACKOFF_MS retries after requested delay", async () => {
+  const clock = new FakeClock(10_000);
+  const ctx = createMockCtx();
+  let attempts = 0;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __random: () => 0, // Zero jitter for exact floor assertion
+    __fetch: async () => {
+      attempts++;
+      if (attempts === 1) {
+        return new Response("429", {
+          status: 429,
+          headers: { "Retry-After": "5" },
+        });
+      }
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(attempts, 2);
+  assert.equal(clock.sleepCalls.length, 1);
+  assert.equal(clock.sleepCalls[0].ms, 5000, "delay must equal the 5s Retry-After floor");
 });

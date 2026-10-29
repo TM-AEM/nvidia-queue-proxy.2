@@ -24,6 +24,10 @@ const DEFAULT_MAX_QUEUE_WAIT_MS = 60_000;
 const DEFAULT_MAX_QUEUE_DEPTH = 100;
 const DEFAULT_MAX_BODY_BYTES = 20 * 1024 * 1024;
 const DEFAULT_REQUEST_BODY_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_CONCURRENT_BODY_READS = 100;
+const MAX_CONCURRENT_BODY_READS_LIMIT = 10_000;
+const DEFAULT_MAX_AGGREGATE_BODY_BYTES = 32 * 1024 * 1024;
+const MAX_AGGREGATE_BODY_BYTES_LIMIT = 64 * 1024 * 1024;
 
 const MAX_TIMEOUT_MS = 86_400_000;
 const MAX_RPM_LIMIT = 100_000;
@@ -115,6 +119,22 @@ const CONFIG_SPECS = {
     default: DEFAULT_REQUEST_BODY_TIMEOUT_MS,
     min: MIN_REQUEST_BODY_TIMEOUT_MS,
     max: MAX_REQUEST_BODY_TIMEOUT_MS,
+    integer: true,
+    allowZero: false,
+  },
+  MAX_CONCURRENT_BODY_READS: {
+    envNames: ["MAX_CONCURRENT_BODY_READS"],
+    default: DEFAULT_MAX_CONCURRENT_BODY_READS,
+    min: 1,
+    max: MAX_CONCURRENT_BODY_READS_LIMIT,
+    integer: true,
+    allowZero: false,
+  },
+  MAX_AGGREGATE_BODY_BYTES: {
+    envNames: ["MAX_AGGREGATE_BODY_BYTES"],
+    default: DEFAULT_MAX_AGGREGATE_BODY_BYTES,
+    min: 1024,
+    max: MAX_AGGREGATE_BODY_BYTES_LIMIT,
     integer: true,
     allowZero: false,
   },
@@ -236,6 +256,13 @@ export class BodyReadTimeoutError extends Error {
   }
 }
 
+export class AggregateBodyLimitExceededError extends Error {
+  constructor() {
+    super("Aggregate request body memory limit exceeded");
+    this.name = "AggregateBodyLimitExceededError";
+  }
+}
+
 function cancelReaderBounded(
   reader,
   reason,
@@ -281,6 +308,7 @@ export async function readBoundedBody(
     setTimeoutImpl = setTimeout,
     clearTimeoutImpl = clearTimeout,
     cancelGraceMs = DEFAULT_BODY_CANCEL_GRACE_MS,
+    onChunk = null,
   } = options;
 
   const declared = request.headers.get("content-length");
@@ -327,6 +355,10 @@ export async function readBoundedBody(
 
       if (total > maxBytes) {
         throw new BodyTooLargeError();
+      }
+
+      if (typeof onChunk === "function") {
+        onChunk(value.byteLength);
       }
 
       chunks.push(value);
@@ -532,30 +564,39 @@ export function sleep(ms, signal) {
   });
 }
 
-export function retryAfterMs(
-  response,
-  now = Date.now(),
-  maxMs = MAX_BACKOFF_MS
-) {
+export function parseRetryAfterMs(response, now = Date.now()) {
   const value = response?.headers?.get("Retry-After");
 
-  if (!value) return 0;
+  if (!value) return null;
 
   const trimmed = value.trim();
   const seconds = Number(trimmed);
 
   if (!Number.isNaN(seconds)) {
-    // Math.min also caps non-finite values (e.g. "1e400" -> Infinity).
-    return seconds > 0
-      ? Math.min(maxMs, Math.round(seconds * 1000))
-      : 0;
+    if (seconds <= 0) return 0;
+    const ms = seconds * 1000;
+    return Number.isFinite(ms) ? Math.round(ms) : Infinity;
   }
 
   const date = Date.parse(trimmed);
 
-  return Number.isFinite(date)
-    ? Math.min(maxMs, Math.max(0, date - now))
-    : 0;
+  if (Number.isFinite(date)) {
+    return Math.max(0, date - now);
+  }
+
+  return null;
+}
+
+export function retryAfterMs(
+  response,
+  now = Date.now(),
+  maxMs = MAX_BACKOFF_MS
+) {
+  const parsed = parseRetryAfterMs(response, now);
+
+  if (parsed === null) return 0;
+
+  return Math.min(maxMs, parsed);
 }
 
 // Additive jitter: spreads retries upward to desynchronize clients without ever
@@ -640,6 +681,8 @@ export class RateGate extends DurableObject {
 
     this.waitingQueue = [];
     this.activeTicket = null;
+    this.activeBodyReads = 0;
+    this.activeBodyBytes = 0;
 
     this.now =
       typeof env?.__now === "function"
@@ -898,7 +941,48 @@ export class RateGate extends DurableObject {
       MAX_QUEUE_DEPTH: maxQueueDepth,
       MAX_BODY_BYTES: maxBodyBytes,
       REQUEST_BODY_TIMEOUT_MS: requestBodyTimeoutMs,
+      MAX_CONCURRENT_BODY_READS: maxConcurrentBodyReads,
+      MAX_AGGREGATE_BODY_BYTES: maxAggregateBodyBytes,
     } = config;
+
+    const hasBodyStream = Boolean(request.body);
+
+    let declaredBytes = 0;
+    const clHeader = request.headers.get("content-length");
+    if (clHeader !== null) {
+      const n = Number(clHeader);
+      if (Number.isFinite(n) && n > 0) {
+        declaredBytes = n;
+      }
+    }
+
+    if (
+      hasBodyStream &&
+      (this.activeBodyReads >= maxConcurrentBodyReads ||
+        (declaredBytes > 0 &&
+          this.activeBodyBytes + declaredBytes > maxAggregateBodyBytes))
+    ) {
+      const retryAfterSec = Math.max(
+        1,
+        Math.ceil(cooldownMs / 1000)
+      );
+
+      return Response.json(
+        { error: "Too many concurrent uploads, please retry later" },
+        {
+          status: 503,
+          headers: {
+            "Retry-After": String(retryAfterSec),
+          },
+        }
+      );
+    }
+
+    let allocatedBytes = declaredBytes;
+    if (hasBodyStream) {
+      this.activeBodyReads++;
+      this.activeBodyBytes += allocatedBytes;
+    }
 
     let body;
 
@@ -910,9 +994,35 @@ export class RateGate extends DurableObject {
           timeoutMs: requestBodyTimeoutMs,
           setTimeoutImpl: this.setTimeoutImpl,
           clearTimeoutImpl: this.clearTimeoutImpl,
+          onChunk: (chunkBytes) => {
+            if (declaredBytes === 0) {
+              this.activeBodyBytes += chunkBytes;
+              allocatedBytes += chunkBytes;
+              if (this.activeBodyBytes > maxAggregateBodyBytes) {
+                throw new AggregateBodyLimitExceededError();
+              }
+            }
+          },
         }
       );
     } catch (bodyError) {
+      if (bodyError instanceof AggregateBodyLimitExceededError) {
+        const retryAfterSec = Math.max(
+          1,
+          Math.ceil(cooldownMs / 1000)
+        );
+
+        return Response.json(
+          { error: "Too many concurrent uploads, please retry later" },
+          {
+            status: 503,
+            headers: {
+              "Retry-After": String(retryAfterSec),
+            },
+          }
+        );
+      }
+
       if (bodyError instanceof BodyTooLargeError) {
         return Response.json(
           { error: "Request body too large" },
@@ -938,6 +1048,17 @@ export class RateGate extends DurableObject {
         { error: "Failed to read request body" },
         { status: 400 }
       );
+    } finally {
+      if (hasBodyStream) {
+        this.activeBodyReads = Math.max(
+          0,
+          this.activeBodyReads - 1
+        );
+        this.activeBodyBytes = Math.max(
+          0,
+          this.activeBodyBytes - allocatedBytes
+        );
+      }
     }
 
     if (request.signal?.aborted) {
@@ -1168,6 +1289,30 @@ export class RateGate extends DurableObject {
         await this.ctx.storage.put("rate-state", state);
 
         if (retry >= MAX_429_RETRIES) {
+          this.releaseSlot();
+
+          if (request.signal) {
+            request.signal.removeEventListener(
+              "abort",
+              onClientAbort
+            );
+          }
+
+          return new Response(retryBody, {
+            status: 429,
+            headers: retryHeaders,
+          });
+        }
+
+        const requestedRetryAfterMs = parseRetryAfterMs(
+          upstreamResponse,
+          this.now()
+        );
+
+        if (
+          requestedRetryAfterMs !== null &&
+          requestedRetryAfterMs > MAX_BACKOFF_MS
+        ) {
           this.releaseSlot();
 
           if (request.signal) {
