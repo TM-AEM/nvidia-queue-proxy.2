@@ -28,6 +28,7 @@ const DEFAULT_MAX_CONCURRENT_BODY_READS = 100;
 const MAX_CONCURRENT_BODY_READS_LIMIT = 10_000;
 const DEFAULT_MAX_AGGREGATE_BODY_BYTES = 32 * 1024 * 1024;
 const MAX_AGGREGATE_BODY_BYTES_LIMIT = 64 * 1024 * 1024;
+const DEFAULT_STREAM_CANCEL_GRACE_MS = 10_000;
 
 const MAX_TIMEOUT_MS = 86_400_000;
 const MAX_RPM_LIMIT = 100_000;
@@ -407,12 +408,20 @@ export async function readBoundedBody(
     return chunks[0];
   }
 
+  // Assemble the final body. The aggregate byte reservation is still held
+  // while this copy runs, so the destination buffer is bounded by the budget.
+  // Clear each source chunk reference as soon as it has been copied so the
+  // original per-chunk buffers can be reclaimed immediately instead of the
+  // whole `chunks` array and `combined` being retained simultaneously (which
+  // would momentarily double the request's resident body memory).
   const combined = new Uint8Array(total);
   let offset = 0;
 
-  for (const chunk of chunks) {
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
     combined.set(chunk, offset);
     offset += chunk.byteLength;
+    chunks[i] = null;
   }
 
   return combined;
@@ -570,17 +579,31 @@ export function parseRetryAfterMs(response, now = Date.now()) {
   if (!value) return null;
 
   const trimmed = value.trim();
-  const seconds = Number(trimmed);
 
-  if (!Number.isNaN(seconds)) {
-    // RFC 7231 / RFC 9110 §10.2.3: delay-seconds = 1*DIGIT
-    // Non-negative integer seconds only; reject fractional seconds or negative numbers
-    if (trimmed.includes(".") || seconds < 0) {
-      return null;
+  // RFC 7231 / RFC 9110 §10.2.3: Retry-After = HTTP-date / delay-seconds,
+  // delay-seconds = 1*DIGIT. A bare delay-seconds value must therefore be a
+  // non-empty, digits-only string; coercive numeric parsing (e.g. "+5",
+  // "5abc", "1e2", "Infinity") is rejected so that malformed headers follow
+  // the documented fallback rather than silently becoming a delay.
+  const delayMatch = /^\d+$/.test(trimmed);
+
+  if (delayMatch) {
+    const seconds = Number(trimmed);
+
+    if (seconds === 0) {
+      return 0;
     }
-    if (seconds === 0) return 0;
+
     const ms = seconds * 1000;
     return Number.isFinite(ms) ? Math.round(ms) : Infinity;
+  }
+
+  // Reject anything that looks numeric (fractional seconds, scientific
+  // notation, +/- prefix, Infinity/NaN) before attempting HTTP-date parsing:
+  // Date.parse() is over-permissive and can turn "1.5" into a date, which is
+  // not a valid Retry-After value per RFC 7231 / RFC 9110.
+  if (/^[+-]?\d+([.,]\d+)?([eE][+-]?\d+)?\s*$/.test(trimmed)) {
+    return null;
   }
 
   const date = Date.parse(trimmed);
@@ -660,22 +683,121 @@ export function computeBackoffDelay(
   return delay;
 }
 
+// Headers that must never be forwarded downstream from an upstream response.
+//
+// - The first group is the HTTP/1.1 hop-by-hop set (RFC 9110 §7.6.1): these
+//   describe a single connection and are meaningless (and unsafe) to relay.
+// - The second group carries credentials or session state that belong to the
+//   upstream and must not leak to the client.
+// - `content-length` is always removed because the proxy may buffer, transform,
+//   or stream-replace the body, so the upstream length would be wrong.
+const HOP_BY_HOP_RESPONSE_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+];
+
+const SENSITIVE_RESPONSE_HEADERS = [
+  "authorization",
+  "proxy-authorization",
+  "set-cookie",
+  "set-cookie2",
+];
+
+// Headers that disclose the proxy's or the upstream's network topology,
+// infrastructure, or request-chain metadata. They are hop-by-hop-adjacent
+// intermediary metadata (RFC 9110 §7.6.3 `Via`/`Server`/`Forwarded`) that a
+// transparent API gateway must not relay: doing so can reveal client IPs,
+// internal hosts, or intermediate proxies to the downstream client. They are
+// removed even though the proxy otherwise preserves unknown vendor headers, so
+// no recognized vendor payload header is affected.
+const TOPOLOGY_RESPONSE_HEADERS = [
+  "forwarded",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-forwarded-port",
+  "x-real-ip",
+  "via",
+  "server",
+];
+
+// Distributed-tracing and platform-internal diagnostic header *families*.
+//
+// These prefixes are reserved by the tracing/infrastructure platforms that mint
+// them (W3C Trace Context, Zipkin `b3`, AWS `x-amz*`, Azure `x-ms-*`, Envoy
+// `x-envoy-*`, gRPC `grpc-*`) and are never part of an API payload. A
+// transparent gateway that forwards them leaks internal trace identifiers,
+// infrastructure host/service names, and routing metadata to the client.
+//
+// Only these reserved families are matched by prefix; deliberately neutral
+// vendor headers (e.g. `x-custom-upstream`, `x-request-id`, `openai-*`,
+// `x-ratelimit-*`) are unaffected, preserving the documented passthrough
+// contract.
+const INFRASTRUCTURE_RESPONSE_HEADER_PREFIXES = [
+  "x-amz-",
+  "x-amzn-",
+  "x-ms-",
+  "x-b3-",
+  "x-envoy-",
+  "x-cloud-trace-",
+  "grpc-",
+  "traceparent",
+  "tracestate",
+];
+
+// Sanitize an upstream response header set before it is forwarded downstream.
 export function safeResponseHeaders(headers) {
   const result = new Headers(headers);
 
-  for (const name of [
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "content-length",
-  ]) {
+  for (const name of HOP_BY_HOP_RESPONSE_HEADERS) {
     result.delete(name);
   }
+
+  for (const name of SENSITIVE_RESPONSE_HEADERS) {
+    result.delete(name);
+  }
+
+  for (const name of TOPOLOGY_RESPONSE_HEADERS) {
+    result.delete(name);
+  }
+
+  // Remove reserved distributed-tracing / platform-internal header families by
+  // prefix. The set of present header names is snapshotted first so deletion
+  // during iteration is safe.
+  for (const name of [...result.keys()]) {
+    for (const prefix of INFRASTRUCTURE_RESPONSE_HEADER_PREFIXES) {
+      if (name.startsWith(prefix)) {
+        result.delete(name);
+        break;
+      }
+    }
+  }
+
+  // Headers nominated by the upstream `Connection` header are themselves
+  // hop-by-hop and must be removed along with the `Connection` header
+  // (RFC 9110 §7.6.1). The tokens are parsed from the pre-sanitized value so a
+  // header named only via `Connection` cannot survive.
+  const connectionValue = headers.get("connection");
+
+  if (connectionValue) {
+    for (const token of connectionValue.split(",")) {
+      const name = token.trim().toLowerCase();
+
+      if (name) {
+        result.delete(name);
+      }
+    }
+  }
+
+  // The body may have been buffered, transformed, or replaced; the upstream
+  // length is never valid downstream.
+  result.delete("content-length");
 
   return result;
 }
@@ -701,20 +823,10 @@ export class RateGate extends DurableObject {
         ? env.__sleep
         : sleep;
 
-    this.getSleepImpl = () => this.sleepImpl || sleep;
-
     this.fetchImpl =
       typeof env?.__fetch === "function"
         ? env.__fetch
         : boundFetch;
-
-    this.getFetchImpl = () =>
-      this.fetchImpl ||
-      (
-        typeof this.env?.__fetch === "function"
-          ? this.env.__fetch
-          : fetch
-      );
 
     this.setTimeoutImpl =
       typeof env?.__setTimeout === "function"
@@ -1008,6 +1120,22 @@ export class RateGate extends DurableObject {
       this.activeBodyBytes += allocatedBytes;
     }
 
+    // The aggregate byte budget must be charged for as long as the buffered
+    // body is retained by the application, not merely while it is being read.
+    // The buffer stays alive across the queue wait and upstream dispatch, so
+    // the reservation is held until the request's terminal path. This flag
+    // makes the release idempotent so every exit path releases exactly once.
+    let bodyRetained = hasBodyStream;
+
+    const releaseBodyRetention = () => {
+      if (!bodyRetained) return;
+      bodyRetained = false;
+      this.activeBodyBytes = Math.max(
+        0,
+        this.activeBodyBytes - allocatedBytes
+      );
+    };
+
     let body;
 
     try {
@@ -1032,6 +1160,10 @@ export class RateGate extends DurableObject {
         }
       );
     } catch (bodyError) {
+      // The body was not (fully) retained: release its byte reservation now.
+      // The read concurrency slot is released in the `finally` below.
+      releaseBodyRetention();
+
       if (bodyError instanceof AggregateBodyLimitExceededError) {
         const retryAfterSec = Math.max(
           1,
@@ -1075,19 +1207,19 @@ export class RateGate extends DurableObject {
         { status: 400 }
       );
     } finally {
+      // Body-read concurrency is released as soon as the read settles; only
+      // the retained-byte budget is held for the body's full lifetime.
       if (hasBodyStream) {
         this.activeBodyReads = Math.max(
           0,
           this.activeBodyReads - 1
         );
-        this.activeBodyBytes = Math.max(
-          0,
-          this.activeBodyBytes - allocatedBytes
-        );
       }
     }
 
     if (request.signal?.aborted) {
+      releaseBodyRetention();
+
       return Response.json(
         { error: "Client cancelled" },
         { status: 499 }
@@ -1102,6 +1234,8 @@ export class RateGate extends DurableObject {
         1,
         Math.ceil(cooldownMs / 1000)
       );
+
+      releaseBodyRetention();
 
       return Response.json(
         { error: "Queue depth exceeded" },
@@ -1121,11 +1255,14 @@ export class RateGate extends DurableObject {
     );
 
     if (ticket.rejectedResponse) {
+      releaseBodyRetention();
+
       return ticket.rejectedResponse;
     }
 
     if (request.signal?.aborted) {
       this.releaseSlot();
+      releaseBodyRetention();
 
       return Response.json(
         { error: "Client cancelled" },
@@ -1402,68 +1539,149 @@ export class RateGate extends DurableObject {
 
       const reader = upstreamResponse.body.getReader();
 
-      let released = false;
+      let slotReleased = false;
+      let cleanupDone = false;
       let idleTimer = null;
       let idleTimedOut = false;
       let controllerRef = null;
       let cancelPromise = null;
 
-      const cancelUpstream = (reason) => {
-        if (!cancelPromise) {
-          let resolveCancel;
+      // Status recorded when the upstream cancellation promise settles. Set
+      // true when the upstream confirmed termination (cancel settled or the
+      // upstream connection closed); false when the grace period elapsed
+      // first (reader.cancel() never settled).
+      let cancelStatus = { resolved: false, settled: false };
 
-          cancelPromise = new Promise((resolve) => {
-            resolveCancel = resolve;
+      const cancelUpstream = (reason) => {
+        if (cancelPromise) {
+          return cancelPromise;
+        }
+
+        let resolveCancel;
+
+        cancelPromise = new Promise((resolve) => {
+          resolveCancel = resolve;
+        });
+
+        if (!upstreamAbortController.signal.aborted) {
+          upstreamAbortController.abort(reason);
+        }
+
+        (async () => {
+          // Race the upstream reader cancellation against a bounded grace
+          // period. The downstream client never waits more than the grace
+          // period for its cancel() to resolve, so a never-settling
+          // reader.cancel() cannot hang required cleanup indefinitely.
+          //
+          // `graceElapsed` records whether the grace timer already resolved
+          // the downstream cancelPromise with `settled: false`. Even after the
+          // grace elapses, a later real settlement of reader.cancel() upgrades
+          // `cancelStatus.settled` to true and re-enters finish() so the held
+          // concurrency slot is released.
+          let graceElapsed = false;
+
+          const recordSettlement = (settled) => {
+            cancelStatus.resolved = true;
+            cancelStatus.settled = settled;
+          };
+
+          const cancelDone = Promise.resolve(
+            reader.cancel(reason)
+          ).catch(() => {
+            // A rejected reader.cancel() still means the upstream reader is
+            // terminal (it will not be read again), so it counts as settled.
           });
 
-          if (!upstreamAbortController.signal.aborted) {
-            upstreamAbortController.abort(reason);
+          const graceTimer = this.setTimeoutImpl(() => {
+            if (graceElapsed) return;
+            graceElapsed = true;
+            // AUDIT-02: reader.cancel() never settled within the grace
+            // period. Do NOT release the concurrency slot on a timer: the
+            // upstream operation may still be active, and releasing the
+            // slot here would allow queued requests to overlap the still-
+            // running upstream — breaking the one-request-at-a-time
+            // invariant. The slot is preserved until the upstream truly
+            // terminates; queued requests remain blocked until then.
+            recordSettlement(false);
+            resolveCancel(cancelStatus);
+          }, DEFAULT_STREAM_CANCEL_GRACE_MS);
+
+          await cancelDone;
+
+          if (!graceElapsed) {
+            this.clearTimeoutImpl(graceTimer);
+            graceElapsed = true;
+            recordSettlement(true);
+            resolveCancel(cancelStatus);
+            return;
           }
 
-          (async () => {
-            try {
-              await reader.cancel(reason);
-            } catch {}
-
-            resolveCancel();
-          })();
-        }
+          // Grace already elapsed and resolved the downstream cancelPromise
+          // with settled:false. The upstream has now confirmed termination, so
+          // upgrade the status and let finish() release the held slot.
+          if (!cancelStatus.settled) {
+            recordSettlement(true);
+            await finish();
+          }
+        })();
 
         return cancelPromise;
       };
 
       let onAbortStream = null;
 
+      // Complete shutdown of the response stream. Idempotent and re-entrant:
+      // the one-time terminal cleanup runs under `cleanupDone`, while the
+      // queue slot is released under `slotReleased` the moment upstream
+      // termination is confirmed. This split matters for AUDIT-02: when the
+      // grace period elapses first the slot is intentionally held, and it must
+      // still be releasable if the upstream later terminates on its own.
       const finish = async () => {
         if (cancelPromise) {
           await cancelPromise;
         }
 
-        if (released) return;
+        // Cleanup that is safe regardless of upstream confirmation: detach the
+        // downstream consumer, drain pending idle timer, and drop all abort
+        // listeners so a later upstream abort cannot re-enter here.
+        if (!cleanupDone) {
+          cleanupDone = true;
 
-        released = true;
-        clearIdleTimer();
+          clearIdleTimer();
 
-        if (onAbortStream) {
-          upstreamAbortController.signal.removeEventListener(
-            "abort",
-            onAbortStream
-          );
-        }
+          if (onAbortStream) {
+            upstreamAbortController.signal.removeEventListener(
+              "abort",
+              onAbortStream
+            );
+            onAbortStream = null;
+          }
 
-        if (request.signal) {
-          request.signal.removeEventListener(
-            "abort",
-            onClientAbort
-          );
-        }
+          if (request.signal) {
+            request.signal.removeEventListener("abort", onClientAbort);
+          }
 
-        try {
           state.lastCompletionAt = this.getNow();
-
           await this.ctx.storage.put("rate-state", state);
-        } finally {
-          this.upstreamInFlight = false;
+        }
+
+        // Release the concurrency slot only if upstream termination was
+        // confirmed. If reader.cancel() never settled within the grace
+        // period, the slot is held so queued requests cannot be dispatched
+        // while the (possibly still active) upstream connection is owned by
+        // the finished request. The downstream client is already unblocked
+        // because cancelPromise resolved within the grace period, and any
+        // later upstream termination re-enters finish() to release the slot.
+        //
+        // AUDIT-02 documented limitation: if the upstream ignores
+        // cancellation and never terminates the connection, this slot remains
+        // held indefinitely. Queue liveness for new clients is preserved
+        // because each queued request is dropped with a 503 at its
+        // MAX_QUEUE_WAIT_MS, so no client waits forever; the affected
+        // instance simply cannot admit a new upstream request until the
+        // upstream connection stops.
+        if (cancelStatus.settled && !slotReleased) {
+          slotReleased = true;
           this.releaseSlot();
         }
       };
@@ -1478,12 +1696,12 @@ export class RateGate extends DurableObject {
       const armIdleTimer = () => {
         clearIdleTimer();
 
-        if (released || idleTimedOut) return;
+        if (cleanupDone || idleTimedOut) return;
 
         idleTimer = this.setTimeoutImpl(async () => {
           idleTimer = null;
 
-          if (released || idleTimedOut) return;
+          if (cleanupDone || idleTimedOut) return;
 
           idleTimedOut = true;
 
@@ -1499,7 +1717,7 @@ export class RateGate extends DurableObject {
       };
 
       onAbortStream = async () => {
-        if (released) return;
+        if (cleanupDone) return;
 
         clearIdleTimer();
 
@@ -1538,11 +1756,26 @@ export class RateGate extends DurableObject {
             } catch (readError) {
               clearIdleTimer();
 
-              if (
-                idleTimedOut ||
-                released ||
-                upstreamAbortController.signal.aborted
-              ) {
+              // Upstream connection terminated (read error): positive
+              // confirmation that the upstream is no longer active, so the
+              // slot may be released even if reader.cancel() never settled.
+              cancelStatus.resolved = true;
+              cancelStatus.settled = true;
+
+              if (idleTimedOut || cleanupDone) {
+                // Already in/about to be in terminal shutdown; just allow any
+                // pending slot release to run.
+                await finish();
+                return;
+              }
+
+              if (upstreamAbortController.signal.aborted) {
+                // We aborted the upstream ourselves (client cancel or idle
+                // shutdown). The downstream controller was already errored by
+                // the abort path, so only surface termination and let
+                // finish() release the held slot.
+                await cancelUpstream(readError);
+                await finish();
                 return;
               }
 
@@ -1558,14 +1791,28 @@ export class RateGate extends DurableObject {
 
             clearIdleTimer();
 
-            if (idleTimedOut || released) return;
+            if (idleTimedOut) {
+              await finish();
+              return;
+            }
 
             if (result.done) {
               if (cancelPromise) {
                 await cancelPromise;
               }
 
-              controller.close();
+              // Upstream connection terminated normally (done): confirmation
+              // that the upstream is no longer active, so the slot may be
+              // released even if reader.cancel() never settled.
+              cancelStatus.resolved = true;
+              cancelStatus.settled = true;
+
+              if (!cleanupDone) {
+                try {
+                  controller.close();
+                } catch {}
+              }
+
               await finish();
             } else {
               controller.enqueue(result.value);
@@ -1614,6 +1861,13 @@ export class RateGate extends DurableObject {
         { error: "Proxy upstream request failed" },
         { status: 502 }
       );
+    } finally {
+      // The buffered request body is no longer needed once dispatch has been
+      // attempted to completion (or the request terminated), so its aggregate
+      // byte reservation is released here — exactly once for every terminal
+      // path that reaches dispatch (success, streaming, timeout, cancellation,
+      // upstream error).
+      releaseBodyRetention();
     }
   }
 }
@@ -1626,7 +1880,34 @@ export default {
       url.pathname === "/health" &&
       request.method === "GET"
     ) {
+      // Liveness only: the Worker is running and can answer. This is
+      // deliberately independent of configuration and bindings so it cannot be
+      // used to probe readiness, and it never touches the upstream or consumes
+      // inference quota.
       return Response.json({ ok: true });
+    }
+
+    if (
+      url.pathname === "/ready" &&
+      request.method === "GET"
+    ) {
+      // Readiness: report whether the required bindings/configuration are
+      // present and usable, without disclosing any values. No upstream request
+      // is made, so no inference quota is consumed.
+      const checks = {
+        proxy_key: typeof env.PROXY_KEY === "string" && env.PROXY_KEY.length > 0,
+        upstream_key:
+          typeof env.NVIDIA_API_KEY === "string" &&
+          env.NVIDIA_API_KEY.length > 0,
+        rate_gate: Boolean(env.RATE_GATE),
+      };
+
+      const ready = Object.values(checks).every(Boolean);
+
+      return Response.json(
+        { ready, checks },
+        { status: ready ? 200 : 503 }
+      );
     }
 
     if (!env.PROXY_KEY || !env.NVIDIA_API_KEY) {

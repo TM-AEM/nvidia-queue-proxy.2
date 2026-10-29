@@ -33,6 +33,7 @@ const {
   BodyTooLargeError,
   BodyReadTimeoutError,
   AggregateBodyLimitExceededError,
+  default: worker,
 } = await import("../src/index.js");
 
 // ==========================================
@@ -3460,10 +3461,13 @@ test("NQP-P2-04: retryAfterMs caps oversized and extreme values at the backoff m
   const mk = (v) => new Response("429", { headers: { "Retry-After": v } });
 
   assert.equal(retryAfterMs(mk("999999999"), now), 30_000, "a huge seconds value is capped");
-  assert.equal(retryAfterMs(mk("1e400"), now), 30_000, "a non-finite seconds value is capped");
   assert.equal(retryAfterMs(mk("1000000"), now), 30_000, "a very large seconds value is capped");
   assert.equal(retryAfterMs(mk("5"), now), 5_000, "a valid small value is preserved exactly");
   assert.equal(retryAfterMs(mk("999"), now, 5_000), 5_000, "a custom cap is honored");
+  // "1e400" is not a valid delay-seconds (1*DIGIT) and is not an HTTP-date, so
+  // it is malformed and follows the documented fallback (0 => use exponential
+  // backoff) rather than being coerced into an unbounded "Infinity" delay.
+  assert.equal(retryAfterMs(mk("1e400"), now), 0, "a malformed non-digit value falls back instead of being coerced");
 
   const farFuture = new Date(now + 9_999_999_999).toUTCString();
   assert.equal(retryAfterMs(mk(farFuture), now), 30_000, "a far-future HTTP-date is capped");
@@ -3754,7 +3758,12 @@ test("AUDIT-05: parseRetryAfterMs parses numeric and HTTP-date forms", () => {
   assert.equal(parseRetryAfterMs(mk("5"), baseTime), 5000);
   assert.equal(parseRetryAfterMs(mk("60"), baseTime), 60_000);
   assert.equal(parseRetryAfterMs(mk("1.5"), baseTime), null, "fractional seconds must return null per RFC 7231");
-  assert.equal(parseRetryAfterMs(mk("1e400"), baseTime), Infinity);
+  // Non-digit characters are rejected strictly per RFC 7231 delay-seconds = 1*DIGIT.
+  assert.equal(parseRetryAfterMs(mk("1e400"), baseTime), null);
+  assert.equal(parseRetryAfterMs(mk("+5"), baseTime), null);
+  assert.equal(parseRetryAfterMs(mk("5abc"), baseTime), null);
+  assert.equal(parseRetryAfterMs(mk("abc5"), baseTime), null);
+  assert.equal(parseRetryAfterMs(mk("Infinity"), baseTime), null);
 
   const future = new Date(baseTime + 15_000).toUTCString();
   assert.equal(parseRetryAfterMs(mk(future), baseTime), 15_000);
@@ -4030,4 +4039,1827 @@ test("AUDIT-02: upstream reader.cancel rejection is caught cleanly and releases 
 
   // Slot should be cleanly released without unhandled rejection
   assert.equal(rateGate.activeTicket, null, "slot must be released cleanly after cancel rejection");
+});
+
+// ==========================================
+// BATCH 1 REVIEW — AUDIT-01 aggregate memory bound
+// ==========================================
+//
+// These tests target the exact admission order: the declared Content-Length is
+// validated, checked against MAX_BODY_BYTES, then reserved against the
+// concurrency and aggregate-byte budgets in the same synchronous step before
+// the body is read. They prove that concurrent large declared-length requests
+// cannot be granted reservations whose total exceeds the aggregate budget, and
+// that all reservations are released exactly once on every terminal path.
+
+function makeAggregateEnv(overrides = {}) {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => new Response("ok", { status: 200 }),
+    ...overrides,
+  };
+  return { clock, ctx, env };
+}
+
+// A body source that never yields a chunk until the test explicitly releases
+// it, so a request stays admitted-but-not-yet-producing for as long as needed.
+function createGatedStream() {
+  let releaseGate;
+  const gate = new Promise((resolve) => {
+    releaseGate = resolve;
+  });
+  const stream = new ReadableStream(
+    {
+      async start(controller) {
+        await gate;
+        controller.enqueue(new TextEncoder().encode("{}"));
+        controller.close();
+      },
+    },
+    { highWaterMark: 0 }
+  );
+  return { stream, release: () => releaseGate() };
+}
+
+test("AUDIT-01: concurrent large declared-length requests cannot exceed the aggregate budget", async () => {
+  // Aggregate budget 1024; each request declares 600. Only one may be admitted;
+  // the second must be rejected before it can be read or dispatched.
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: 1024,
+    MAX_CONCURRENT_BODY_READS: 10,
+  });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  const gated = createGatedStream();
+  const p1 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "600" },
+      body: gated.stream,
+      duplex: "half",
+    })
+  );
+
+  await tick();
+
+  // While request 1 holds a 600-byte reservation (and has not produced any
+  // chunk yet), request 2 declares another 600 -> 1200 > 1024 -> rejected.
+  const res2 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "600" },
+      body: "x".repeat(600),
+    })
+  );
+
+  assert.equal(res2.status, 503, "the over-budget reservation must be rejected");
+  assert.equal(
+    (await res2.json()).error,
+    "Too many concurrent uploads, please retry later"
+  );
+
+  // Only the single 600-byte reservation is held; the budget is never exceeded.
+  assert.ok(
+    rateGate.activeBodyBytes <= 1024,
+    "aggregate byte reservation must never exceed the configured budget"
+  );
+
+  gated.release();
+  const res1 = await p1;
+  assert.equal(res1.status, 200);
+  await res1.text();
+
+  assert.equal(rateGate.activeBodyReads, 0, "counters restored after success");
+  assert.equal(rateGate.activeBodyBytes, 0, "counters restored after success");
+});
+
+test("AUDIT-01: declared reservations summing exactly to the budget are both admitted", async () => {
+  // Aggregate budget 1024; two requests of 512 each = exactly the budget.
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: 1024,
+    MAX_CONCURRENT_BODY_READS: 10,
+  });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  const g1 = createGatedStream();
+  const g2 = createGatedStream();
+
+  const p1 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "512" },
+      body: g1.stream,
+      duplex: "half",
+    })
+  );
+  await tick();
+
+  const p2 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "512" },
+      body: g2.stream,
+      duplex: "half",
+    })
+  );
+  await tick();
+
+  assert.equal(rateGate.activeBodyReads, 2, "both requests admitted");
+  assert.equal(
+    rateGate.activeBodyBytes,
+    1024,
+    "reservations sum exactly to the budget, never above it"
+  );
+
+  g1.release();
+  g2.release();
+
+  // The queue slot is serialized, so drain request 1's response before
+  // awaiting request 2 (whose upstream dispatch waits for that release).
+  const res1 = await p1;
+  assert.equal(res1.status, 200);
+  await res1.text();
+
+  const res2 = await p2;
+  assert.equal(res2.status, 200);
+  await res2.text();
+
+  assert.equal(rateGate.activeBodyReads, 0);
+  assert.equal(rateGate.activeBodyBytes, 0);
+});
+
+test("AUDIT-01: unknown-length chunked stream is accounted before retention and bounded", async () => {
+  // No declared length. The aggregate budget is 1024; the stream produces
+  // 600 + 600 = 1200 bytes. The second chunk must be refused before it is
+  // retained, so the aggregate limit is enforced even without Content-Length.
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: 1024,
+    MAX_CONCURRENT_BODY_READS: 10,
+    MAX_BODY_BYTES: 20 * 1024,
+  });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  const stream = new ReadableStream(
+    {
+      start(controller) {
+        controller.enqueue(new Uint8Array(600));
+        controller.enqueue(new Uint8Array(600));
+        controller.close();
+      },
+    },
+    { highWaterMark: 0 }
+  );
+
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: stream,
+      duplex: "half",
+    })
+  );
+
+  assert.equal(res.status, 503, "chunked overflow is rejected");
+  assert.equal(
+    (await res.json()).error,
+    "Too many concurrent uploads, please retry later"
+  );
+  assert.equal(rateGate.activeBodyReads, 0, "counters restored after rejection");
+  assert.equal(rateGate.activeBodyBytes, 0, "counters restored after rejection");
+});
+
+test("AUDIT-01: a request rejected before admission never acquires a queue slot", async () => {
+  const { clock, env } = makeAggregateEnv({
+    MAX_BODY_BYTES: 1024,
+    MAX_AGGREGATE_BODY_BYTES: 4096,
+  });
+  let fetchCalls = 0;
+  env.__fetch = async () => {
+    fetchCalls++;
+    return new Response("ok", { status: 200 });
+  };
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "2048" },
+      body: "x".repeat(2048),
+    })
+  );
+
+  assert.equal(res.status, 413);
+  assert.equal(rateGate.activeTicket, null, "no queue slot acquired");
+  assert.equal(rateGate.waitingQueue.length, 0, "nothing queued");
+  assert.equal(fetchCalls, 0, "upstream was never contacted");
+  assert.equal(rateGate.activeBodyReads, 0);
+  assert.equal(rateGate.activeBodyBytes, 0);
+});
+
+test("AUDIT-01: reservations are released exactly once after a body-read timeout", async () => {
+  const timers = createFakeTimers();
+  const { clock, env } = makeAggregateEnv({
+    REQUEST_BODY_TIMEOUT_MS: 1000,
+    MAX_AGGREGATE_BODY_BYTES: 4096,
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+  });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  // A body that never completes: the deadline is the only thing that fires.
+  const stalled = new ReadableStream(
+    {
+      pull() {
+        /* never enqueues */
+      },
+    },
+    { highWaterMark: 0 }
+  );
+
+  const p = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "10" },
+      body: stalled,
+      duplex: "half",
+    })
+  );
+
+  await tick();
+  assert.equal(rateGate.activeBodyReads, 1, "reservation held while reading");
+
+  // Advance the virtual clock past the body deadline.
+  timers.advance(1000);
+
+  const res = await p;
+  assert.equal(res.status, 408, "body read timeout surfaces as 408");
+  assert.equal(rateGate.activeBodyReads, 0, "reservation released exactly once");
+  assert.equal(rateGate.activeBodyBytes, 0, "byte reservation released");
+});
+
+test("AUDIT-01: reservations are released exactly once after a client abort", async () => {
+  const { env } = makeAggregateEnv({ MAX_AGGREGATE_BODY_BYTES: 4096 });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  const controller = new AbortController();
+
+  // Simulate the runtime tying the request signal to the body stream: on abort
+  // the pending read rejects, exactly as an aborted upstream body would.
+  const stalled = new ReadableStream(
+    {
+      start(streamController) {
+        controller.signal.addEventListener(
+          "abort",
+          () => streamController.error(new Error("client aborted")),
+          { once: true }
+        );
+      },
+      pull() {
+        /* never enqueues */
+      },
+      cancel() {
+        /* cooperative */
+      },
+    },
+    { highWaterMark: 0 }
+  );
+
+  const p = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "content-length": "10" },
+      body: stalled,
+      duplex: "half",
+    })
+  );
+
+  await tick();
+  assert.equal(rateGate.activeBodyReads, 1, "reservation held while reading");
+
+  controller.abort("client gone");
+
+  const res = await p;
+  assert.equal(res.status, 499, "abort surfaces as 499");
+  assert.equal(rateGate.activeBodyReads, 0, "reservation released exactly once");
+  assert.equal(rateGate.activeBodyBytes, 0, "byte reservation released");
+});
+
+test("AUDIT-01: an absent Content-Length is treated as chunked and never reserves more than the budget", async () => {
+  // Budget 1000, per-request limit 1000. A body delivered as a single 1500-byte
+  // chunk exceeds the per-request limit; the read fails before retention.
+  const { env } = makeAggregateEnv({
+    MAX_BODY_BYTES: 1000,
+    MAX_AGGREGATE_BODY_BYTES: 4096,
+  });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  const stream = new ReadableStream(
+    {
+      start(controller) {
+        controller.enqueue(new Uint8Array(1500));
+        controller.close();
+      },
+    },
+    { highWaterMark: 0 }
+  );
+
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: stream,
+      duplex: "half",
+    })
+  );
+
+  assert.equal(res.status, 413, "per-request limit enforced without Content-Length");
+  assert.equal(rateGate.activeBodyReads, 0);
+  assert.equal(rateGate.activeBodyBytes, 0);
+});
+
+// ==========================================
+// BATCH 1 REVIEW — AUDIT-01 aggregate memory bound
+// ==========================================
+//
+// These tests target the quantitative memory policy: admissions must reserve
+// declared capacity atomically, committed retained bytes must never exceed the
+// aggregate budget, chunked streams must be bounded per chunk, and capacity
+// must be released so a valid request can succeed afterwards.
+
+test("AUDIT-01: committed retained bytes never exceed the aggregate budget when many chunked streams are all admitted before any yields a chunk", async () => {
+  // Every request is unknown-length, so all pass admission with a zero-byte
+  // reservation. They are then released together so each has a chunk in flight
+  // before accounting runs. Committed bytes must still never exceed the budget.
+  const BUDGET = 1024;
+  const CHUNK = 600;
+  const N = 8;
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: BUDGET,
+    MAX_CONCURRENT_BODY_READS: 1000,
+    MAX_BODY_BYTES: 100 * 1024,
+  });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  // Observe the peak committed (accounted) retained bytes.
+  let peakCommitted = 0;
+  let stored = 0;
+  Object.defineProperty(rateGate, "activeBodyBytes", {
+    get() {
+      return stored;
+    },
+    set(value) {
+      stored = value;
+      if (value > peakCommitted) peakCommitted = value;
+    },
+    configurable: true,
+  });
+
+  const pulls = [];
+  const streams = [];
+  for (let i = 0; i < N; i++) {
+    streams.push(
+      new ReadableStream(
+        {
+          pull(controller) {
+            pulls.push(() => {
+              controller.enqueue(new Uint8Array(CHUNK));
+              controller.close();
+            });
+          },
+        },
+        { highWaterMark: 0 }
+      )
+    );
+  }
+
+  const promises = streams.map((body) =>
+    rateGate.fetch(
+      new Request("https://proxy.internal/v1/chat/completions", {
+        method: "POST",
+        body,
+        duplex: "half",
+      })
+    )
+  );
+
+  // Let all N requests reach admission and issue their first read.
+  await tick();
+  await tick();
+  await tick();
+  assert.equal(pulls.length, N, "all requests admitted and awaiting a chunk");
+  assert.equal(rateGate.activeBodyBytes, 0, "unknown-length admissions reserve nothing");
+
+  // Release every chunk "simultaneously".
+  pulls.forEach((p) => p());
+
+  const results = await Promise.all(promises);
+  const statuses = results.map((r) => r.status);
+
+  assert.ok(
+    statuses.includes(200),
+    "at least one request fits within the budget"
+  );
+  assert.ok(
+    peakCommitted <= BUDGET,
+    `committed retained bytes (${peakCommitted}) must never exceed the budget (${BUDGET})`
+  );
+  assert.equal(rateGate.activeBodyBytes, 0, "all reservations released");
+  assert.equal(rateGate.activeBodyReads, 0, "all reader reservations released");
+});
+
+test("AUDIT-01: a chunk exceeding the remaining aggregate capacity is rejected without retention", async () => {
+  const BUDGET = 1200;
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: BUDGET,
+    MAX_CONCURRENT_BODY_READS: 100,
+    MAX_BODY_BYTES: 100 * 1024,
+  });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  // First request reserves 700 bytes of the 1000 budget (declared length).
+  const holderGate = createGatedStreamWithSize(700);
+  const holder = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "700" },
+      body: holderGate.stream,
+      duplex: "half",
+    })
+  );
+  await tick();
+  assert.equal(rateGate.activeBodyBytes, 700, "700 reserved by the holder");
+
+  // A chunked request delivers a single 600-byte chunk: 700 + 600 = 1300 > 1200
+  // so it must be rejected at accounting time and never retained.
+  const overflow = new ReadableStream(
+    {
+      start(controller) {
+        controller.enqueue(new Uint8Array(600));
+        controller.close();
+      },
+    },
+    { highWaterMark: 0 }
+  );
+
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: overflow,
+      duplex: "half",
+    })
+  );
+
+  assert.equal(res.status, 503, "the over-budget chunk is rejected");
+  assert.equal(
+    (await res.json()).error,
+    "Too many concurrent uploads, please retry later"
+  );
+  assert.equal(
+    rateGate.activeBodyBytes,
+    700,
+    "the rejected chunk's bytes were never retained"
+  );
+
+  holderGate.release();
+  const holderRes = await holder;
+  assert.equal(holderRes.status, 200);
+});
+
+test("AUDIT-01: a valid request succeeds after the previous reservation is released", async () => {
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: 1024,
+    MAX_CONCURRENT_BODY_READS: 1,
+  });
+  let fetchCount = 0;
+  env.__fetch = async () => {
+    fetchCount++;
+    return new Response("ok", { status: 200 });
+  };
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  const first = await rateGate.fetch(chatRequest("x".repeat(100)));
+  assert.equal(first.status, 200, "first request succeeds");
+  assert.equal(fetchCount, 1, "first request reached upstream");
+  assert.equal(rateGate.activeBodyReads, 0, "first reservation released");
+  assert.equal(rateGate.activeBodyBytes, 0, "first bytes released");
+  // Drain the response so the inference execution slot is released before the
+  // next request is admitted.
+  await first.text();
+
+  // With the reservation released, a second request must be admitted.
+  const second = await rateGate.fetch(chatRequest("y".repeat(100)));
+  assert.equal(second.status, 200, "second request succeeds after release");
+  assert.equal(fetchCount, 2, "second request reached upstream");
+  assert.equal(rateGate.activeBodyReads, 0);
+  assert.equal(rateGate.activeBodyBytes, 0);
+  await second.text();
+});
+
+test("AUDIT-01: a duplicated Content-Length header is rejected and cannot bypass admission", async () => {
+  // A duplicated Content-Length is combined by the runtime into "10, 10",
+  // which is not a valid delay-seconds-style integer. The proxy must reject it
+  // rather than trusting either value, so it cannot bypass the size gates.
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: 1024,
+    MAX_CONCURRENT_BODY_READS: 100,
+    MAX_BODY_BYTES: 100 * 1024,
+  });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  const headers = new Headers();
+  headers.append("content-length", "10");
+  headers.append("content-length", "10");
+
+  const stream = new ReadableStream(
+    {
+      start(controller) {
+        controller.enqueue(new Uint8Array(600));
+        controller.enqueue(new Uint8Array(600));
+        controller.close();
+      },
+    },
+    { highWaterMark: 0 }
+  );
+
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: stream,
+      duplex: "half",
+    })
+  );
+
+  assert.equal(res.status, 400, "a malformed duplicated Content-Length is rejected");
+  assert.equal(
+    (await res.json()).error,
+    "Invalid Content-Length header"
+  );
+  assert.equal(rateGate.activeBodyReads, 0, "no reader reservation was taken");
+  assert.equal(rateGate.activeBodyBytes, 0, "no byte reservation was taken");
+});
+
+test("AUDIT-01: multi-chunk bodies are assembled correctly and counted once", async () => {
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: 4096,
+    MAX_BODY_BYTES: 4096,
+  });
+  let receivedBody = null;
+  env.__fetch = async (_url, opts) => {
+    receivedBody = opts.body instanceof Uint8Array ? opts.body : null;
+    return new Response("ok", { status: 200 });
+  };
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  const stream = new ReadableStream(
+    {
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3]));
+        controller.enqueue(new Uint8Array([4, 5]));
+        controller.enqueue(new Uint8Array([6]));
+        controller.close();
+      },
+    },
+    { highWaterMark: 0 }
+  );
+
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: stream,
+      duplex: "half",
+    })
+  );
+
+  assert.equal(res.status, 200, "multi-chunk body is accepted");
+  assert.deepEqual(
+    Array.from(receivedBody),
+    [1, 2, 3, 4, 5, 6],
+    "assembled body preserves chunk order and content"
+  );
+  assert.equal(rateGate.activeBodyReads, 0, "reservation released after success");
+  assert.equal(rateGate.activeBodyBytes, 0, "bytes released after success");
+});
+
+// A gated stream that declares a size via a buffered chunk, used to hold a
+// reservation without completing the body until explicitly released.
+function createGatedStreamWithSize(size) {
+  let releaseGate;
+  const gate = new Promise((resolve) => {
+    releaseGate = resolve;
+  });
+  const stream = new ReadableStream(
+    {
+      async start(controller) {
+        await gate;
+        controller.enqueue(new Uint8Array(size));
+        controller.close();
+      },
+    },
+    { highWaterMark: 0 }
+  );
+  return { stream, release: () => releaseGate() };
+}
+
+// ==========================================
+// BATCH 1 REVIEW — AUDIT-02 upstream cancellation
+// ==========================================
+//
+// The upstream reader.cancel() is raced against a bounded grace period. The
+// downstream cancel() must always resolve. Crucially, the concurrency slot is
+// NOT released merely because the grace timer elapsed: if cancellation never
+// settles, the slot is preserved (fail-closed) until the upstream actually
+// terminates, so a queued request cannot overlap a possibly-active upstream.
+
+test("AUDIT-02: upstream reader.cancel() resolving releases the slot", async () => {
+  const { env } = makeAggregateEnv();
+  let upstreamCancelReason = null;
+
+  env.__fetch = async () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("chunk-1"));
+        },
+        cancel(reason) {
+          upstreamCancelReason = reason;
+          return Promise.resolve();
+        },
+      }),
+      { status: 200 }
+    );
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(chatRequest());
+  const reader = res.body.getReader();
+  await reader.read();
+
+  await reader.cancel("client abort");
+
+  assert.equal(
+    upstreamCancelReason,
+    "client abort",
+    "the upstream reader.cancel() must receive the downstream reason"
+  );
+  assert.equal(rateGate.activeTicket, null, "slot released after cooperative cancel");
+});
+
+test("AUDIT-02: upstream reader.cancel() rejecting still releases the slot without unhandled rejection", async () => {
+  const { env } = makeAggregateEnv();
+
+  env.__fetch = async () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("chunk-1"));
+        },
+        cancel() {
+          return Promise.reject(new Error("socket destroyed"));
+        },
+      }),
+      { status: 200 }
+    );
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(chatRequest());
+  const reader = res.body.getReader();
+  await reader.read();
+
+  await reader.cancel("client abort");
+
+  assert.equal(
+    rateGate.activeTicket,
+    null,
+    "a rejecting cancel() must not block slot release"
+  );
+});
+
+test("AUDIT-02: a never-settling reader.cancel() still resolves the downstream cancel() within the bounded grace", async () => {
+  const timers = createFakeTimers();
+  const { env } = makeAggregateEnv({
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+  });
+
+  env.__fetch = async () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("chunk-1"));
+        },
+        cancel() {
+          // Never settles: the upstream ignores cancellation.
+          return new Promise(() => {});
+        },
+      }),
+      { status: 200 }
+    );
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(chatRequest());
+  const reader = res.body.getReader();
+  await reader.read();
+
+  let cancelResolved = false;
+  const cancelResult = reader
+    .cancel("client abort")
+    .then(() => {
+      cancelResolved = true;
+    });
+
+  await tick();
+  assert.equal(
+    cancelResolved,
+    false,
+    "the downstream cancel() must not resolve before the grace period"
+  );
+
+  // Fire the bounded cancellation grace timer.
+  timers.advance(10_000);
+
+  await cancelResult;
+  assert.equal(
+    cancelResolved,
+    true,
+    "the downstream cancel() must resolve once the bounded grace elapses"
+  );
+
+  // Fail-closed: the slot must NOT be released on the grace timer alone.
+  assert.notEqual(
+    rateGate.activeTicket,
+    null,
+    "the slot must be held while the upstream may still be active"
+  );
+});
+
+test("AUDIT-02: the slot is released once the upstream stream confirms termination, regardless of a never-settling cancel()", async () => {
+  const timers = createFakeTimers();
+  const { env } = makeAggregateEnv({
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+  });
+
+  // The upstream stream yields one chunk and then ends (done). Its cancel()
+  // never settles, so the queued request must rely on the upstream actually
+  // reporting termination before the slot can be released.
+  env.__fetch = async () =>
+    new Response(
+      new ReadableStream(
+        {
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("chunk-1"));
+            controller.close();
+          },
+          cancel() {
+            return new Promise(() => {});
+          },
+        },
+        { highWaterMark: 0 }
+      ),
+      { status: 200 }
+    );
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(chatRequest());
+  const reader = res.body.getReader();
+
+  // Drain the stream. When the upstream reports done, the proxy confirms
+  // termination and releases the slot even though cancel() never settles.
+  let chunk = await reader.read();
+  while (!chunk.done) {
+    chunk = await reader.read();
+  }
+
+  for (let i = 0; i < 100 && rateGate.activeTicket !== null; i++) {
+    await tick();
+  }
+
+  assert.equal(
+    rateGate.activeTicket,
+    null,
+    "a confirmed upstream termination releases the slot"
+  );
+  assert.equal(rateGate.activeBodyReads, 0, "no body reservations leak");
+});
+
+test("AUDIT-02: a queued request waits behind a never-settling cancellation and is not dispatched while upstream may be active", async () => {
+  const timers = createFakeTimers();
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let op2Dispatched = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    // The queue-wait timer uses the real event loop; keep it short so op2 is
+    // released promptly once it is clear the slot will not free up.
+    MAX_QUEUE_WAIT_MS: 50,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async (url, opts) => {
+      const tag = opts.headers.get("x-tag");
+      if (tag === "op1") {
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("chunk-1"));
+            },
+            cancel() {
+              return new Promise(() => {});
+            },
+          }),
+          { status: 200 }
+        );
+      }
+      op2Dispatched = true;
+      return new Response("ok-2", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  const res1 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-tag": "op1" },
+      body: "{}",
+    })
+  );
+  const reader1 = res1.body.getReader();
+  await reader1.read();
+
+  const cancelP = reader1.cancel("client abort");
+  await tick();
+
+  // op2 queues behind op1's held slot.
+  const p2 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-tag": "op2" },
+      body: "{}",
+    })
+  );
+
+  await tick();
+
+  // Even after the cancellation grace elapses, op2 must NOT be dispatched
+  // while the upstream may still be active (fail-closed).
+  timers.advance(10_000);
+  await cancelP;
+  await tick();
+  await tick();
+
+  assert.equal(
+    op2Dispatched,
+    false,
+    "a queued request must not overlap a possibly-active upstream"
+  );
+  assert.equal(rateGate.waitingQueue.length, 1, "op2 remains queued");
+
+  // The real queue-wait timer releases op2 with a 503 without ever
+  // dispatching it to the (possibly still active) upstream.
+  const res2 = await p2;
+  assert.equal(res2.status, 503, "op2 is released with 503 at its queue-wait limit");
+});
+
+test("AUDIT-02: repeated concurrent completion and abort events release the slot exactly once", async () => {
+  const { env } = makeAggregateEnv();
+  let releaseCount = 0;
+
+  env.__fetch = async () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("chunk-1"));
+        },
+        cancel() {
+          return Promise.resolve();
+        },
+      }),
+      { status: 200 }
+    );
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const originalRelease = rateGate.releaseSlot.bind(rateGate);
+  rateGate.releaseSlot = () => {
+    releaseCount += 1;
+    return originalRelease();
+  };
+
+  const res = await rateGate.fetch(chatRequest());
+  const reader = res.body.getReader();
+  await reader.read();
+
+  // Fire downstream cancel and an independent completion attempt concurrently.
+  await Promise.all([
+    reader.cancel("client abort"),
+    Promise.resolve().then(() => tick()),
+  ]);
+
+  assert.equal(releaseCount, 1, "releaseSlot must run exactly once");
+  assert.equal(rateGate.activeTicket, null, "slot is free");
+});
+
+// ==========================================
+// BATCH 1 REVIEW — AUDIT-02 late upstream termination after a held grace
+// ==========================================
+
+// Regression for the re-entrant finish() path: when cancellation does not
+// settle within the bounded grace, the slot is intentionally held
+// (fail-closed). If the upstream then *does* confirm the cancellation after
+// the grace elapses, finish() must re-enter and release the held slot rather
+// than leaving it stuck forever.
+test("AUDIT-02: a held slot is released when cancellation settles after the grace elapses", async () => {
+  const timers = createFakeTimers();
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+
+  let releaseCancel;
+  const cancelGate = new Promise((resolve) => {
+    releaseCancel = resolve;
+  });
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    // The upstream yields one chunk, then ignores cancellation until the test
+    // explicitly releases it. This forces the proxy's bounded grace to elapse
+    // first, after which the upstream finally confirms termination.
+    __fetch: async () =>
+      new Response(
+        new ReadableStream(
+          {
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("chunk-1"));
+            },
+            cancel() {
+              return cancelGate;
+            },
+          },
+          { highWaterMark: 0 }
+        ),
+        { status: 200 }
+      ),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+  const reader = res.body.getReader();
+
+  await reader.read(); // consume chunk-1
+
+  const cancelP = reader.cancel("client abort");
+  await tick();
+
+  // The bounded grace has not elapsed yet: cancel() must still be pending and
+  // the slot held.
+  assert.notEqual(
+    rateGate.activeTicket,
+    null,
+    "the slot is held while cancellation is unsettled"
+  );
+
+  // Elapse the cancellation grace: the downstream cancel() resolves, but the
+  // slot stays held because cancellation has not settled.
+  timers.advance(10_000);
+  await cancelP;
+
+  assert.notEqual(
+    rateGate.activeTicket,
+    null,
+    "fail-closed: the slot must remain held after the grace elapses"
+  );
+
+  // Now the upstream finally confirms the cancellation. This is positive
+  // evidence the upstream is no longer active, so the held slot must be
+  // released.
+  releaseCancel();
+
+  for (let i = 0; i < 100 && rateGate.activeTicket !== null; i++) {
+    await tick();
+  }
+
+  assert.equal(
+    rateGate.activeTicket,
+    null,
+    "a late cancellation confirmation must release the previously held slot"
+  );
+});
+
+// ==========================================
+// BATCH 1 REVIEW — AUDIT-05 Retry-After semantics
+// ==========================================
+
+test("AUDIT-05: malformed Retry-After values follow the documented fallback, valid ones are capped", () => {
+  const now = 1_000_000;
+  const mk = (v) => new Response("429", { headers: { "Retry-After": v } });
+
+  // Malformed per RFC 7231 delay-seconds = 1*DIGIT -> fallback (0).
+  for (const bad of ["5abc", "abc5", "+5", "1e2", "1E2", "Infinity", "NaN", "1.5", "2.0", "-5", "5,5", ""]) {
+    assert.equal(retryAfterMs(mk(bad), now), 0, `malformed "${bad}" must fall back`);
+  }
+
+  // Valid integer seconds -> honored, then capped at MAX_BACKOFF_MS.
+  assert.equal(retryAfterMs(mk("5"), now), 5000);
+  assert.equal(retryAfterMs(mk("999999999"), now), 30_000, "valid huge value is capped, not rejected");
+});
+
+test("AUDIT-05: parseRetryAfterMs rejects fractional and non-digit delay-seconds", () => {
+  const now = 1_000_000;
+  const mk = (v) => new Response("", { headers: { "Retry-After": v } });
+
+  assert.equal(parseRetryAfterMs(mk("1.5"), now), null);
+  assert.equal(parseRetryAfterMs(mk("2.0"), now), null);
+  assert.equal(parseRetryAfterMs(mk("5abc"), now), null);
+  assert.equal(parseRetryAfterMs(mk("1e2"), now), null);
+  assert.equal(parseRetryAfterMs(mk("+5"), now), null);
+  assert.equal(parseRetryAfterMs(mk("Infinity"), now), null);
+  assert.equal(parseRetryAfterMs(mk("5"), now), 5000);
+  assert.equal(parseRetryAfterMs(mk("0"), now), 0);
+});
+
+test("AUDIT-05: the original valid Retry-After survives downstream sanitization on the final 429", async () => {
+  const { clock, env } = makeAggregateEnv({ __random: () => 0 });
+  let attempts = 0;
+  env.__fetch = async () => {
+    attempts++;
+    return new Response(JSON.stringify({ error: "rate limit" }), {
+      status: 429,
+      headers: {
+        "Retry-After": "60",
+        "Content-Type": "application/json",
+        Connection: "keep-alive",
+        "Transfer-Encoding": "chunked",
+      },
+    });
+  };
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  assert.equal(res.headers.get("Retry-After"), "60", "valid Retry-After is preserved downstream");
+  assert.equal(res.headers.get("connection"), null, "hop-by-hop headers are still stripped");
+  assert.equal(res.headers.get("transfer-encoding"), null, "hop-by-hop headers are still stripped");
+  assert.equal(attempts, 1, "no early retry when Retry-After exceeds MAX_BACKOFF_MS");
+  assert.equal(rateGate.activeTicket, null, "slot released exactly once");
+});
+
+test("AUDIT-05: cancellation during the retry backoff does not trigger a retry after the request finished", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  let attempts = 0;
+  const controller = new AbortController();
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    // Abort the request while sleeping in the retry backoff.
+    __sleep: (ms, signal) =>
+      new Promise((resolve, reject) => {
+        controller.abort("client gone");
+        if (signal?.aborted) {
+          reject(signal.reason || new Error("Aborted"));
+          return;
+        }
+        resolve();
+      }),
+    __random: () => 0,
+    __fetch: async () => {
+      attempts++;
+      return new Response("429", { status: 429, headers: { "Retry-After": "1" } });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+      signal: controller.signal,
+    })
+  );
+
+  assert.equal(res.status, 499, "cancellation during backoff returns 499");
+  assert.equal(attempts, 1, "no further upstream attempt after cancellation");
+  assert.equal(rateGate.activeTicket, null, "slot released exactly once");
+});
+
+test("AUDIT-05: a 429 exhausted retry path releases the slot exactly once", async () => {
+  const { env } = makeAggregateEnv({ __random: () => 0 });
+  let attempts = 0;
+  env.__fetch = async () => {
+    attempts++;
+    return new Response("", { status: 429 }); // no Retry-After -> exponential backoff
+  };
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  assert.equal(attempts, 6, "initial attempt plus 5 retries");
+  assert.equal(rateGate.activeTicket, null, "slot released exactly once after exhaustion");
+  assert.equal(rateGate.waitingQueue.length, 0, "no lingering waiters");
+});
+
+// ==========================================
+// BATCH 2 — AUDIT-07 upstream response-header sanitization
+// ==========================================
+
+test("AUDIT-07: safeResponseHeaders removes hop-by-hop, sensitive, and Connection-nominated headers", () => {
+  const upstream = new Headers({
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    "x-custom-upstream": "keep-me",
+    connection: "keep-alive, x-internal-trace",
+    "keep-alive": "timeout=5",
+    "transfer-encoding": "chunked",
+    "x-internal-trace": "secret-trace-id",
+    "proxy-authenticate": "Basic realm=x",
+    "set-cookie": "session=abc; HttpOnly",
+    authorization: "Bearer upstream-secret",
+    "content-length": "1234",
+  });
+
+  const safe = safeResponseHeaders(upstream);
+
+  assert.equal(safe.get("content-type"), "text/event-stream", "content-type is preserved");
+  assert.equal(safe.get("cache-control"), "no-cache", "cache-control is preserved");
+  assert.equal(safe.get("x-custom-upstream"), "keep-me", "unknown upstream headers are preserved (transparent passthrough)");
+
+  for (const removed of [
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "proxy-authenticate",
+    "authorization",
+    "set-cookie",
+    "content-length",
+    "x-internal-trace",
+  ]) {
+    assert.equal(safe.get(removed), null, `${removed} must not be forwarded`);
+  }
+});
+
+test("AUDIT-07: safeResponseHeaders removes only headers named by Connection and keeps the rest", () => {
+  const upstream = new Headers({
+    "content-type": "application/json",
+    connection: "X-Hop-One, x-hop-two",
+    "x-hop-one": "1",
+    "x-hop-two": "2",
+    "x-keep": "3",
+  });
+
+  const safe = safeResponseHeaders(upstream);
+
+  assert.equal(safe.get("x-hop-one"), null, "Connection-nominated header is removed");
+  assert.equal(safe.get("x-hop-two"), null, "Connection-nominated header is removed (case-insensitive)");
+  assert.equal(safe.get("x-keep"), "3", "unrelated header survives");
+  assert.equal(safe.get("content-type"), "application/json");
+});
+
+test("AUDIT-07: a successful proxied response forwards safe headers and drops sensitive ones", async () => {
+  const { env } = makeAggregateEnv();
+  env.__fetch = async () =>
+    new Response("hello", {
+      status: 200,
+      headers: {
+        "content-type": "text/plain",
+        "cache-control": "max-age=60",
+        "x-request-id": "abc-123",
+        "set-cookie": "sid=leak",
+        connection: "x-secret-relay",
+        "x-secret-relay": "should-not-appear",
+        "content-length": "5",
+      },
+    });
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "text/plain");
+  assert.equal(res.headers.get("cache-control"), "max-age=60");
+  assert.equal(res.headers.get("x-request-id"), "abc-123");
+  assert.equal(res.headers.get("set-cookie"), null, "upstream cookie must not leak");
+  assert.equal(res.headers.get("x-secret-relay"), null, "Connection-nominated header must not leak");
+  assert.equal(res.headers.get("content-length"), null, "content-length is never forwarded");
+  assert.equal(await res.text(), "hello", "body is forwarded unchanged");
+  assert.equal(rateGate.activeTicket, null, "slot released after completion");
+});
+
+test("AUDIT-07: a streaming upstream response keeps streaming headers and drops sensitive ones", async () => {
+  const { env } = makeAggregateEnv();
+  env.__fetch = async () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("data: a\n\n"));
+          controller.close();
+        },
+      }),
+      {
+        status: 200,
+        headers: {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive, x-internal",
+          "x-internal": "internal-only",
+          "transfer-encoding": "chunked",
+          "content-length": "20",
+        },
+      }
+    );
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "text/event-stream");
+  assert.equal(res.headers.get("cache-control"), "no-cache");
+  assert.equal(res.headers.get("x-internal"), null, "Connection-nominated header is stripped");
+  assert.equal(res.headers.get("transfer-encoding"), null, "hop-by-hop transfer-encoding is stripped");
+  assert.equal(res.headers.get("content-length"), null, "content-length is never forwarded on a stream");
+  assert.equal(await res.text(), "data: a\n\n", "streamed body is delivered intact");
+});
+
+test("AUDIT-07: the 429 retry path sanitizes upstream headers before returning the body", async () => {
+  const { env } = makeAggregateEnv({ __random: () => 0 });
+  let attempts = 0;
+  env.__fetch = async () => {
+    attempts++;
+    return new Response(JSON.stringify({ error: "slow down" }), {
+      status: 429,
+      headers: {
+        "content-type": "application/json",
+        "retry-after": "1",
+        "x-custom-upstream": "keep-me",
+        "set-cookie": "sid=leak",
+        connection: "x-listed",
+        "x-listed": "nope",
+        "content-length": "24",
+      },
+    });
+  };
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  assert.equal(res.headers.get("content-type"), "application/json");
+  assert.equal(res.headers.get("x-custom-upstream"), "keep-me", "safe custom header preserved on 429");
+  assert.equal(res.headers.get("retry-after"), "1", "valid Retry-After is preserved");
+  assert.equal(res.headers.get("set-cookie"), null, "upstream cookie must not leak on 429");
+  assert.equal(res.headers.get("x-listed"), null, "Connection-nominated header must not leak on 429");
+  assert.equal(res.headers.get("content-length"), null, "content-length is never forwarded");
+  assert.equal(attempts, 6, "retry behavior is unchanged");
+});
+
+test("AUDIT-07: the proxy's own error responses are not polluted by upstream headers", async () => {
+  const { env } = makeAggregateEnv();
+  // Upstream returns 200 but with an Authorization echo and a cookie.
+  env.__fetch = async () =>
+    new Response("ok", {
+      status: 200,
+      headers: {
+        "content-type": "text/plain",
+        authorization: "Bearer upstream-secret",
+        "set-cookie": "sid=leak",
+      },
+    });
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("authorization"), null, "upstream Authorization echo must not leak");
+  assert.equal(res.headers.get("set-cookie"), null, "upstream cookie must not leak");
+});
+
+test("AUDIT-07: network-topology and request-chain disclosure headers are not forwarded", () => {
+  const upstream = new Headers({
+    "content-type": "application/json",
+    "x-request-id": "req-1",
+    forwarded: "for=203.0.113.7;proto=https",
+    "x-forwarded-for": "203.0.113.7, 10.0.0.1",
+    "x-forwarded-host": "internal.upstream.local",
+    "x-forwarded-proto": "https",
+    "x-forwarded-port": "443",
+    "x-real-ip": "203.0.113.7",
+    via: "1.1 internal-proxy",
+    server: "envoy/1.30",
+  });
+
+  const safe = safeResponseHeaders(upstream);
+
+  assert.equal(safe.get("content-type"), "application/json", "content-type is preserved");
+  assert.equal(safe.get("x-request-id"), "req-1", "unrelated vendor header is preserved");
+
+  for (const removed of [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-real-ip",
+    "via",
+    "server",
+  ]) {
+    assert.equal(safe.get(removed), null, `${removed} must not be forwarded`);
+  }
+});
+
+test("AUDIT-07: topology disclosure headers are stripped end-to-end while vendor payload headers survive", async () => {
+  const { env } = makeAggregateEnv();
+  env.__fetch = async () =>
+    new Response("ok", {
+      status: 200,
+      headers: {
+        "content-type": "text/plain",
+        "x-request-id": "req-9",
+        "x-ratelimit-remaining-requests": "12",
+        "x-forwarded-for": "203.0.113.7",
+        "x-real-ip": "203.0.113.7",
+        via: "1.1 edge",
+        server: "nginx",
+      },
+    });
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("x-request-id"), "req-9", "vendor request id survives");
+  assert.equal(
+    res.headers.get("x-ratelimit-remaining-requests"),
+    "12",
+    "vendor rate-limit header survives"
+  );
+  assert.equal(res.headers.get("x-forwarded-for"), null, "client IP must not leak");
+  assert.equal(res.headers.get("x-real-ip"), null, "client IP must not leak");
+  assert.equal(res.headers.get("via"), null, "intermediary metadata must not leak");
+  assert.equal(res.headers.get("server"), null, "server banner must not leak");
+});
+
+// ==========================================
+// BATCH 3 — AUDIT-07 infrastructure/tracing header families
+// ==========================================
+
+test("AUDIT-07: reserved distributed-tracing and platform-internal header families are stripped", () => {
+  const upstream = new Headers({
+    "content-type": "application/json",
+    "x-request-id": "req-1",
+    "x-custom-upstream": "keep-me",
+    "x-amzn-trace-id": "Root=1-abc",
+    "x-amz-cf-id": "cf-123",
+    "x-ms-request-id": "azure-id",
+    "x-b3-traceid": "trace",
+    "x-b3-spanid": "span",
+    "x-envoy-upstream-service-time": "12",
+    "x-cloud-trace-context": "ctx",
+    "grpc-status": "0",
+    traceparent: "00-abc-def-01",
+    tracestate: "vendor=x",
+  });
+
+  const safe = safeResponseHeaders(upstream);
+
+  assert.equal(safe.get("content-type"), "application/json", "content-type preserved");
+  assert.equal(safe.get("x-request-id"), "req-1", "neutral correlation id preserved");
+  assert.equal(safe.get("x-custom-upstream"), "keep-me", "neutral vendor header preserved");
+
+  for (const removed of [
+    "x-amzn-trace-id",
+    "x-amz-cf-id",
+    "x-ms-request-id",
+    "x-b3-traceid",
+    "x-b3-spanid",
+    "x-envoy-upstream-service-time",
+    "x-cloud-trace-context",
+    "grpc-status",
+    "traceparent",
+    "tracestate",
+  ]) {
+    assert.equal(safe.get(removed), null, `${removed} must not be forwarded`);
+  }
+});
+
+test("AUDIT-07: infrastructure header families are stripped end-to-end without affecting vendor payload headers", async () => {
+  const { env } = makeAggregateEnv();
+  env.__fetch = async () =>
+    new Response("ok", {
+      status: 200,
+      headers: {
+        "content-type": "text/plain",
+        "x-custom-upstream": "keep-me",
+        "openai-model": "model-x",
+        "x-amzn-trace-id": "Root=1-abc",
+        "x-envoy-upstream-service-time": "9",
+      },
+    });
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("x-custom-upstream"), "keep-me", "documented passthrough preserved");
+  assert.equal(res.headers.get("openai-model"), "model-x", "api payload header preserved");
+  assert.equal(res.headers.get("x-amzn-trace-id"), null, "trace id must not leak");
+  assert.equal(res.headers.get("x-envoy-upstream-service-time"), null, "envoy timing must not leak");
+});
+
+// The pre-existing passthrough contract must remain intact after the Batch 3
+// prefix rules were added.
+test("AUDIT-07: the established x-custom-upstream passthrough contract still holds", async () => {
+  const upstream = new Headers({
+    "x-custom-upstream": "test-val",
+    "content-type": "application/json",
+  });
+  const safe = safeResponseHeaders(upstream);
+  assert.equal(safe.get("x-custom-upstream"), "test-val");
+});
+
+// ==========================================
+// BATCH 3 — AUDIT-06 liveness and readiness
+// ==========================================
+
+test("AUDIT-06: /health is a liveness probe that works even with missing configuration", async () => {
+  const res = await worker.fetch(
+    new Request("https://proxy.local/health", { method: "GET" }),
+    {}
+  );
+
+  assert.equal(res.status, 200, "liveness must succeed regardless of configuration");
+  assert.deepEqual(await res.json(), { ok: true });
+});
+
+test("AUDIT-06: /ready reports ready when all required bindings are present", async () => {
+  const env = {
+    PROXY_KEY: "test-proxy-key",
+    NVIDIA_API_KEY: "test-nvidia-key",
+    RATE_GATE: { idFromName: () => "id", get: () => ({ fetch() {} }) },
+  };
+
+  const res = await worker.fetch(
+    new Request("https://proxy.local/ready", { method: "GET" }),
+    env
+  );
+
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.ready, true);
+  assert.deepEqual(body.checks, {
+    proxy_key: true,
+    upstream_key: true,
+    rate_gate: true,
+  });
+  // No secret values may be present anywhere in the payload.
+  const text = JSON.stringify(body);
+  assert.ok(!text.includes("test-proxy-key"), "must not leak the proxy key");
+  assert.ok(!text.includes("test-nvidia-key"), "must not leak the upstream key");
+});
+
+test("AUDIT-06: /ready reports not-ready with 503 when bindings are missing, without leaking values", async () => {
+  const res = await worker.fetch(
+    new Request("https://proxy.local/ready", { method: "GET" }),
+    {}
+  );
+
+  assert.equal(res.status, 503);
+  const body = await res.json();
+  assert.equal(body.ready, false);
+  assert.deepEqual(body.checks, {
+    proxy_key: false,
+    upstream_key: false,
+    rate_gate: false,
+  });
+});
+
+test("AUDIT-06: /ready reports not-ready when only the rate gate binding is missing", async () => {
+  const res = await worker.fetch(
+    new Request("https://proxy.local/ready", { method: "GET" }),
+    { PROXY_KEY: "k", NVIDIA_API_KEY: "u" }
+  );
+
+  assert.equal(res.status, 503);
+  const body = await res.json();
+  assert.equal(body.ready, false);
+  assert.equal(body.checks.rate_gate, false);
+  assert.equal(body.checks.proxy_key, true);
+  assert.equal(body.checks.upstream_key, true);
+});
+
+// ==========================================
+// BATCH 1 REVIEW — AUDIT-10: buffered-body lifetime accounting
+// ==========================================
+//
+// The aggregate byte budget must be charged for as long as a buffered request
+// body is retained by the application, not merely while it is being read from
+// the network. A body that has finished reading but is still waiting in the
+// FIFO queue is retained and must count against `MAX_AGGREGATE_BODY_BYTES`.
+//
+// These tests drive the real request lifecycle: they keep the active upstream
+// blocked so later requests finish reading and remain queued, and then assert
+// (a) queued bodies count toward the budget, (b) an over-budget request is
+// rejected with 503, and (c) reservations are released exactly once on
+// dispatch completion, cancellation, queue timeout, and read failure.
+
+// A blocking upstream: each dispatch is held until the test releases it, so the
+// active slot stays owned and later requests deterministically queue behind it.
+function createBlockingUpstream() {
+  const releases = [];
+  const fetchImpl = async () => {
+    await new Promise((resolve) => releases.push(resolve));
+    return new Response("ok", { status: 200 });
+  };
+  return {
+    fetchImpl,
+    get pending() {
+      return releases.length;
+    },
+    releaseNext() {
+      const next = releases.shift();
+      assert.ok(next, "an upstream dispatch must be waiting to be released");
+      next();
+    },
+  };
+}
+
+// Wait until a predicate holds, driving the microtask/macrotask queues, without
+// relying on wall-clock sleeps.
+async function waitFor(predicate, label) {
+  for (let i = 0; i < 1000; i++) {
+    if (predicate()) return;
+    await tick();
+  }
+  assert.fail(`Timed out waiting for ${label}`);
+}
+
+function declaredRequest(id, bytes) {
+  return new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-length": String(bytes), "x-req-id": id },
+    body: "x".repeat(bytes),
+  });
+}
+
+test("AUDIT-10: bodies buffered while queued count toward the aggregate budget", async () => {
+  const blocking = createBlockingUpstream();
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: 2048,
+    MAX_CONCURRENT_BODY_READS: 10,
+    MAX_QUEUE_DEPTH: 100,
+    __fetch: (url, opts) => blocking.fetchImpl(url, opts),
+  });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  // Request 1 acquires the active slot and blocks upstream. It retains 600.
+  const p1 = rateGate.fetch(declaredRequest("r1", 600));
+  await waitFor(() => blocking.pending >= 1, "request 1 to reach upstream");
+
+  // Requests 2 and 3 finish reading (600 bytes each) and queue behind r1.
+  const p2 = rateGate.fetch(declaredRequest("r2", 600));
+  const p3 = rateGate.fetch(declaredRequest("r3", 600));
+
+  await waitFor(
+    () => rateGate.waitingQueue.length >= 2,
+    "requests 2 and 3 to queue"
+  );
+
+  // 600 (active r1) + 600 (queued r2) + 600 (queued r3) = 1800 <= 2048.
+  assert.equal(
+    rateGate.activeBodyBytes,
+    1800,
+    "queued bodies must be charged to the aggregate budget"
+  );
+
+  // Request 4 declares 600 -> 1800 + 600 = 2400 > 2048 -> rejected.
+  const res4 = await rateGate.fetch(declaredRequest("r4", 600));
+  assert.equal(res4.status, 503, "the over-budget queued reservation must be rejected");
+  assert.equal(
+    (await res4.json()).error,
+    "Too many concurrent uploads, please retry later"
+  );
+  assert.ok(
+    rateGate.activeBodyBytes <= 2048,
+    "the aggregate budget must never be exceeded while bodies are queued"
+  );
+
+  // Drain: release each upstream dispatch in turn and consume each response so
+  // the streaming path runs to completion and releases its slot for the next
+  // queued request.
+  blocking.releaseNext();
+  const r1res = await p1;
+  await r1res.text();
+  await waitFor(() => blocking.pending >= 1, "request 2 to reach upstream");
+  blocking.releaseNext();
+  const r2res = await p2;
+  await r2res.text();
+  await waitFor(() => blocking.pending >= 1, "request 3 to reach upstream");
+  blocking.releaseNext();
+  const r3res = await p3;
+  await r3res.text();
+
+  assert.equal(
+    rateGate.activeBodyBytes,
+    0,
+    "every reservation must be released once dispatch completes"
+  );
+});
+
+test("AUDIT-10: cancelling a queued request releases its retained-body reservation", async () => {
+  const blocking = createBlockingUpstream();
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: 2048,
+    MAX_CONCURRENT_BODY_READS: 10,
+    MAX_QUEUE_DEPTH: 100,
+    __fetch: (url, opts) => blocking.fetchImpl(url, opts),
+  });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  const p1 = rateGate.fetch(declaredRequest("r1", 600));
+  await waitFor(() => blocking.pending >= 1, "request 1 to reach upstream");
+
+  const abort = new AbortController();
+  const p2 = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "600", "x-req-id": "r2" },
+      body: "x".repeat(600),
+      signal: abort.signal,
+    })
+  );
+
+  await waitFor(
+    () => rateGate.waitingQueue.length >= 1 && rateGate.activeBodyBytes === 1200,
+    "request 2 to queue with its reservation charged"
+  );
+
+  // Cancel the queued request: its reservation must be released exactly once.
+  abort.abort("client abort");
+  const res2 = await p2;
+  assert.equal(res2.status, 499, "a cancelled queued request returns 499");
+  assert.equal(
+    rateGate.activeBodyBytes,
+    600,
+    "only the active request's reservation may remain after the queued cancel"
+  );
+  assert.equal(
+    rateGate.waitingQueue.length,
+    0,
+    "the cancelled request must be removed from the queue"
+  );
+
+  blocking.releaseNext();
+  await p1;
+  assert.equal(rateGate.activeBodyBytes, 0, "the active reservation must be released");
+});
+
+test("AUDIT-10: a queued request that exceeds the queue wait releases its reservation", async () => {
+  const blocking = createBlockingUpstream();
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: 2048,
+    MAX_CONCURRENT_BODY_READS: 10,
+    MAX_QUEUE_DEPTH: 100,
+    // A 1 ms queue-wait deadline keeps the real queue timer short and the test
+    // fast and reliable while still exercising the genuine timeout path.
+    MAX_QUEUE_WAIT_MS: 1,
+    __fetch: (url, opts) => blocking.fetchImpl(url, opts),
+  });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  const p1 = rateGate.fetch(declaredRequest("r1", 600));
+  await waitFor(() => blocking.pending >= 1, "request 1 to reach upstream");
+
+  const p2 = rateGate.fetch(declaredRequest("r2", 600));
+  await waitFor(
+    () => rateGate.activeBodyBytes === 1200,
+    "request 2 to queue with its reservation charged"
+  );
+
+  // The queued request times out on its own deadline and is rejected with 503.
+  const res2 = await p2;
+  assert.equal(res2.status, 503, "a queue-wait timeout returns 503");
+  assert.equal(
+    (await res2.json()).error,
+    "Maximum queue wait exceeded"
+  );
+
+  // Its reservation is released; only the active request's 600 bytes remain.
+  assert.equal(
+    rateGate.activeBodyBytes,
+    600,
+    "the timed-out request's reservation must be released"
+  );
+
+  blocking.releaseNext();
+  await p1;
+  await waitFor(
+    () => rateGate.activeBodyBytes === 0,
+    "the active reservation to be released after dispatch"
+  );
+});
+
+test("AUDIT-10: a read failure releases the retained-body reservation exactly once", async () => {
+  // A body stream whose read rejects: the reservation must be released even
+  // though the body was never fully retained.
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: 2048,
+    MAX_CONCURRENT_BODY_READS: 10,
+  });
+
+  const failingStream = new ReadableStream({
+    pull() {
+      throw new Error("source failure");
+    },
+  });
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-length": "600", "x-req-id": "rf" },
+      body: failingStream,
+      duplex: "half",
+    })
+  );
+
+  assert.equal(res.status, 400, "a failed body read returns 400");
+  assert.equal(
+    rateGate.activeBodyBytes,
+    0,
+    "the byte reservation must be released on read failure"
+  );
+  assert.equal(
+    rateGate.activeBodyReads,
+    0,
+    "the read-concurrency counter must be released on read failure"
+  );
+
+  // A subsequent valid request must still be admitted (no leaked reservation).
+  const ok = await rateGate.fetch(declaredRequest("ok", 600));
+  assert.equal(ok.status, 200, "a valid request must succeed after the failure path");
+  await ok.text();
+  assert.equal(rateGate.activeBodyBytes, 0);
+});
+
+test("AUDIT-10: a successful dispatch releases the retained-body reservation exactly once", async () => {
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: 2048,
+    MAX_CONCURRENT_BODY_READS: 10,
+  });
+  const rateGate = new RateGate(createMockCtx(), env);
+
+  const res = await rateGate.fetch(declaredRequest("ok", 600));
+  assert.equal(res.status, 200);
+  await res.text();
+  assert.equal(rateGate.activeBodyBytes, 0, "reservation released after success");
+  assert.equal(rateGate.activeBodyReads, 0, "read counter released after success");
+});
+
+test("AUDIT-10: a streaming successful response releases the request-body reservation at dispatch", async () => {
+  const { env } = makeAggregateEnv({
+    MAX_AGGREGATE_BODY_BYTES: 2048,
+    MAX_CONCURRENT_BODY_READS: 10,
+  });
+  env.__fetch = async () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("data: a\n\n"));
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } }
+    );
+
+  const rateGate = new RateGate(createMockCtx(), env);
+  const res = await rateGate.fetch(declaredRequest("s1", 600));
+  assert.equal(res.status, 200);
+
+  // The request body is sent to the upstream before the response stream is
+  // consumed, so its reservation is released once dispatch returns, even while
+  // the downstream stream is still being read.
+  assert.equal(
+    rateGate.activeBodyBytes,
+    0,
+    "the request-body reservation is released once dispatch returns"
+  );
+
+  assert.equal(await res.text(), "data: a\n\n");
 });
