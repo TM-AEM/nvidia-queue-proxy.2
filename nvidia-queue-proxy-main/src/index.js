@@ -28,6 +28,26 @@ const MIN_REQUEST_BODY_TIMEOUT_MS = 1_000;
 const MAX_REQUEST_BODY_TIMEOUT_MS = 120_000;
 const DEFAULT_BODY_CANCEL_GRACE_MS = 1_000;
 
+// Maximum number of bytes of an upstream 429 (rate-limit) response body that
+// the proxy will buffer. The error body is only passed through to the client
+// and is never parsed, so a small fixed cap is sufficient; bounding the read
+// prevents a large or hostile rate-limit response from exhausting Durable
+// Object memory. A body that exceeds this cap is replaced with a short
+// synthetic error body (see TRUNCATED_429_BODY).
+const MAX_429_BODY_BYTES = 64 * 1024;
+
+// Hard time cap for reading an upstream 429 error body. Bounds how long a
+// stalled upstream read can hold the active queue slot before the body is
+// abandoned and a synthetic error body is returned.
+const DEFAULT_429_BODY_TIMEOUT_MS = 30_000;
+
+// Deterministic, valid JSON returned in place of an upstream 429 body that was
+// too large or could not be read. Truncating an arbitrary payload could yield
+// invalid JSON, so a fixed synthetic body is returned instead.
+const TRUNCATED_429_BODY = JSON.stringify({
+  error: "Upstream rate-limit response body exceeded the proxy limit",
+});
+
 const CONFIG_SPECS = {
   RPM: {
     envNames: ["RPM"],
@@ -359,6 +379,127 @@ export async function readBoundedBody(
   }
 
   return combined;
+}
+
+// Bounded read of an upstream *response* body. Unlike readBoundedBody (which
+// owns the request-side semantics and has no truncation mode), this helper is
+// used for the upstream 429 error body: it reads incrementally with a hard byte
+// cap and a hard time cap, and reports whether the body was truncated so the
+// caller can substitute a safe synthetic body instead of silently corrupting
+// the payload.
+//
+// Returns { bytes, truncated }. On truncation the upstream stream is cancelled
+// on a best-effort basis, bounded by the same cancel grace used elsewhere so a
+// stalled upstream cancellation cannot hold the queue.
+async function readBoundedResponseBody(
+  response,
+  maxBytes,
+  options = {}
+) {
+  const {
+    timeoutMs = DEFAULT_429_BODY_TIMEOUT_MS,
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
+    cancelGraceMs = DEFAULT_BODY_CANCEL_GRACE_MS,
+  } = options;
+
+  const bodyStream = response?.body;
+
+  if (!bodyStream) {
+    return { bytes: new Uint8Array(0), truncated: false };
+  }
+
+  const reader = bodyStream.getReader();
+  const chunks = [];
+  let total = 0;
+  let timer = null;
+
+  const terminal = { stopped: false };
+
+  const deadline = new Promise((resolve) => {
+    timer = setTimeoutImpl(() => {
+      terminal.stopped = true;
+      resolve();
+    }, timeoutMs);
+  });
+
+  const readDone = (async () => {
+    for (;;) {
+      const { done, value } = await reader.read();
+
+      if (terminal.stopped) return;
+      if (done) return;
+
+      if (value === undefined || value === null) continue;
+
+      if (total + value.byteLength > maxBytes) {
+        terminal.stopped = true;
+        throw new BodyTooLargeError();
+      }
+
+      total += value.byteLength;
+      chunks.push(value);
+    }
+  })();
+
+  readDone.catch(() => {});
+
+  let outcome;
+
+  try {
+    outcome = await Promise.race([
+      readDone.then(() => ({ kind: "done" })),
+      deadline.then(() => ({ kind: "timeout" })),
+    ]);
+  } catch (readError) {
+    // A read failure, an over-limit throw, or a cancellation rejection.
+    terminal.stopped = true;
+    clearTimeoutImpl(timer);
+
+    await cancelReaderBounded(
+      reader,
+      readError,
+      setTimeoutImpl,
+      clearTimeoutImpl,
+      cancelGraceMs
+    );
+
+    return { bytes: null, truncated: true };
+  }
+
+  clearTimeoutImpl(timer);
+
+  if (outcome.kind === "timeout") {
+    terminal.stopped = true;
+
+    await cancelReaderBounded(
+      reader,
+      new BodyReadTimeoutError(),
+      setTimeoutImpl,
+      clearTimeoutImpl,
+      cancelGraceMs
+    );
+
+    return { bytes: null, truncated: true };
+  }
+
+  if (chunks.length === 0) {
+    return { bytes: new Uint8Array(0), truncated: false };
+  }
+
+  if (chunks.length === 1) {
+    return { bytes: chunks[0], truncated: false };
+  }
+
+  const combined = new Uint8Array(total);
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return { bytes: combined, truncated: false };
 }
 
 export function sleep(ms, signal) {
@@ -953,11 +1094,30 @@ export class RateGate extends DurableObject {
           break;
         }
 
-        const retryBody = await upstreamResponse.arrayBuffer();
+        const { bytes: retryBodyBytes, truncated: retryBodyTruncated } =
+          await readBoundedResponseBody(
+            upstreamResponse,
+            MAX_429_BODY_BYTES,
+            {
+              setTimeoutImpl: this.setTimeoutImpl,
+              clearTimeoutImpl: this.clearTimeoutImpl,
+            }
+          );
 
         const retryHeaders = safeResponseHeaders(
           upstreamResponse.headers
         );
+
+        // A body that exceeded the cap (or could not be read) is replaced with a
+        // deterministic synthetic JSON body; the upstream payload is never
+        // returned in a truncated, possibly-corrupt form.
+        const retryBody = retryBodyTruncated
+          ? TRUNCATED_429_BODY
+          : retryBodyBytes;
+
+        if (retryBodyTruncated) {
+          retryHeaders.set("content-type", "application/json");
+        }
 
         state.lastCompletionAt = this.now();
 
