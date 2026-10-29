@@ -23,6 +23,7 @@ const {
   RateGate,
   retryAfterMs,
   computeBackoffDelay,
+  applyBackoffJitter,
   safeResponseHeaders,
   readConfigValue,
   resolveConfig,
@@ -3389,4 +3390,187 @@ test("NQP-429-12: no overlapping upstream requests while handling 429 bodies", a
   assert.equal(maxInFlight, 1, "at most one upstream request may be in flight at a time");
   assert.equal(calls, 7, "six attempts for the first request plus one for the second");
   assert.equal(rateGate.activeTicket, null);
+});
+
+
+// ==========================================
+// NQP-P2 REGRESSION TESTS — Retry-policy hardening (jitter + bounded Retry-After)
+// ==========================================
+//
+// NQP-P2-FINISH adds (a) an additive, bounded jitter band to the retry backoff
+// and (b) an explicit upper bound on Retry-After parsing. These tests pin both
+// behaviors with injected determinism (a fixed __random / random function) so
+// they never depend on wall-clock timing or real randomness.
+
+test("NQP-P2-01: applyBackoffJitter stays within [delay, maxBackoff] across the random domain", () => {
+  const maxBackoff = 30_000;
+
+  for (const delay of [1, 1000, 5000, 24_000, 30_000]) {
+    for (const r of [0, 0.25, 0.5, 0.999999, 1]) {
+      const out = applyBackoffJitter(delay, () => r, maxBackoff);
+
+      assert.ok(
+        out >= delay,
+        `jitter must never reduce the delay (delay=${delay}, r=${r}, out=${out})`
+      );
+      assert.ok(
+        out <= maxBackoff,
+        `jitter must never exceed the maximum (delay=${delay}, r=${r}, out=${out})`
+      );
+      assert.ok(
+        Number.isInteger(out),
+        `jitter must yield an integer millisecond delay (delay=${delay}, r=${r})`
+      );
+    }
+  }
+});
+
+test("NQP-P2-02: applyBackoffJitter is deterministic for injected randomness and preserves zero", () => {
+  assert.equal(applyBackoffJitter(8000, () => 0, 30_000), 8000, "zero random adds nothing");
+  assert.equal(applyBackoffJitter(8000, () => 1, 30_000), 10_000, "full random adds the 25% band");
+  assert.equal(applyBackoffJitter(30_000, () => 1, 30_000), 30_000, "a delay at the cap stays at the cap");
+  assert.equal(applyBackoffJitter(0, () => 1, 30_000), 0, "a zero delay must stay zero (no spurious delay)");
+});
+
+test("NQP-P2-03: jittered backoff never falls below a Retry-After minimum", () => {
+  const now = 100_000;
+  const resp = new Response("429", { headers: { "Retry-After": "10" } });
+
+  const floor = computeBackoffDelay(0, resp, {
+    now,
+    maxBackoffMs: 30_000,
+    jitterFn: (d) => applyBackoffJitter(d, () => 0, 30_000),
+  });
+  assert.equal(floor, 10_000, "with zero jitter the delay equals the Retry-After floor");
+
+  const ceiling = computeBackoffDelay(0, resp, {
+    now,
+    maxBackoffMs: 30_000,
+    jitterFn: (d) => applyBackoffJitter(d, () => 1, 30_000),
+  });
+  assert.equal(ceiling, 12_500, "jitter is applied on top of the Retry-After floor");
+  assert.ok(ceiling >= 10_000, "jitter must never drop below the server-requested Retry-After");
+});
+
+test("NQP-P2-04: retryAfterMs caps oversized and extreme values at the backoff maximum", () => {
+  const now = 1_000_000;
+  const mk = (v) => new Response("429", { headers: { "Retry-After": v } });
+
+  assert.equal(retryAfterMs(mk("999999999"), now), 30_000, "a huge seconds value is capped");
+  assert.equal(retryAfterMs(mk("1e400"), now), 30_000, "a non-finite seconds value is capped");
+  assert.equal(retryAfterMs(mk("1000000"), now), 30_000, "a very large seconds value is capped");
+  assert.equal(retryAfterMs(mk("5"), now), 5_000, "a valid small value is preserved exactly");
+  assert.equal(retryAfterMs(mk("999"), now, 5_000), 5_000, "a custom cap is honored");
+
+  const farFuture = new Date(now + 9_999_999_999).toUTCString();
+  assert.equal(retryAfterMs(mk(farFuture), now), 30_000, "a far-future HTTP-date is capped");
+});
+
+test("NQP-P2-05: the retry path applies jitter to backoff delays and counts each attempt", async () => {
+  const clock = new FakeClock(1_000);
+  const ctx = createMockCtx();
+  let attempts = 0;
+
+  const env = {
+    RPM: 1000,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __random: () => 1,
+    __fetch: async () => {
+      attempts++;
+      return new Response("", { status: 429 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  await res.text();
+
+  assert.equal(attempts, 6, "six attempts (initial + five retries)");
+  assert.deepEqual(
+    clock.sleepCalls.map((c) => c.ms),
+    [1250, 2500, 5000, 10_000, 20_000],
+    "each retry delay must include the additive 25% jitter band (deterministic __random = 1)"
+  );
+
+  const state = await ctx.storage.get("rate-state");
+  assert.equal(state.starts.length, 6, "every upstream attempt is counted exactly once");
+  assert.equal(rateGate.activeTicket, null, "the queue slot is released after retries are exhausted");
+});
+
+test("NQP-P2-06: an oversized Retry-After is capped at the callsite and never overflows", async () => {
+  const clock = new FakeClock(1_000);
+  const ctx = createMockCtx();
+
+  const env = {
+    RPM: 1000,
+    COOLDOWN_MS: 0,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __random: () => 1,
+    __fetch: async () =>
+      new Response("", {
+        status: 429,
+        headers: { "Retry-After": "1000000000" },
+      }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  await res.text();
+
+  assert.equal(clock.sleepCalls.length, 5, "five backoff sleeps between six attempts");
+  for (const call of clock.sleepCalls) {
+    assert.equal(call.ms, 30_000, "a huge Retry-After is capped at the 30s backoff maximum");
+  }
+  assert.equal(rateGate.activeTicket, null, "the queue slot is released");
+});
+
+test("NQP-P3-01: applyBackoffJitter normalizes invalid random sources and stays within bounds", () => {
+  const maxBackoff = 30_000;
+  const delay = 8000;
+  const lo = delay;
+  const hi = maxBackoff;
+
+  // Invalid random sources must never yield a NaN/non-finite delay and must
+  // remain within [delay, maxBackoff]. The documented fallback is 1 (upper
+  // bound), so each of these produces delay + full 25% band = 10000.
+  for (const [label, value] of [
+    ["NaN", NaN],
+    ["undefined", undefined],
+    ["Infinity", Infinity],
+    ["-Infinity", -Infinity],
+    ["null", null],
+    ["negative", -0.5],
+    ["above one", 1.5],
+  ]) {
+    const out = applyBackoffJitter(delay, () => value, maxBackoff);
+
+    assert.ok(Number.isFinite(out), `random=${label} must produce a finite delay (got ${out})`);
+    assert.ok(out >= lo && out <= hi, `random=${label} must stay within [${lo}, ${hi}] (got ${out})`);
+    assert.equal(out, 10_000, `random=${label} must use the documented fallback of 1`);
+  }
+
+  // Valid lower and upper bounds must be used exactly.
+  assert.equal(applyBackoffJitter(delay, () => 0, maxBackoff), lo, "random=0 yields the base delay");
+  assert.equal(applyBackoffJitter(delay, () => 1, maxBackoff), 10_000, "random=1 yields the full band");
+
+  // The random source is sampled exactly once per call.
+  let calls = 0;
+  applyBackoffJitter(delay, () => {
+    calls++;
+    return 0.5;
+  }, maxBackoff);
+  assert.equal(calls, 1, "the injected random source must be called exactly once");
+
+  // Zero and cap semantics are preserved.
+  assert.equal(applyBackoffJitter(0, () => NaN, maxBackoff), 0, "a zero delay stays zero even with an invalid source");
+  assert.equal(applyBackoffJitter(maxBackoff, () => NaN, maxBackoff), maxBackoff, "a delay at the cap stays at the cap");
 });

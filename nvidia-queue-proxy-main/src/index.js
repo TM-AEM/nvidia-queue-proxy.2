@@ -13,6 +13,11 @@ const DEFAULT_RPM = 40;
 const DEFAULT_COOLDOWN_MS = 1_670;
 const MAX_429_RETRIES = 5;
 const MAX_BACKOFF_MS = 30_000;
+// Fraction of the computed delay used as an additive jitter band. Jitter is
+// additive only: it spreads retries upward to desynchronize clients without
+// ever reducing a delay below the policy floor (max of exponential backoff and
+// Retry-After), so a server-requested Retry-After minimum is always honored.
+const BACKOFF_JITTER_FRACTION = 0.25;
 const DEFAULT_RESPONSE_HEADER_TIMEOUT_MS = 30_000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_QUEUE_WAIT_MS = 60_000;
@@ -527,7 +532,11 @@ export function sleep(ms, signal) {
   });
 }
 
-export function retryAfterMs(response, now = Date.now()) {
+export function retryAfterMs(
+  response,
+  now = Date.now(),
+  maxMs = MAX_BACKOFF_MS
+) {
   const value = response?.headers?.get("Retry-After");
 
   if (!value) return 0;
@@ -536,14 +545,44 @@ export function retryAfterMs(response, now = Date.now()) {
   const seconds = Number(trimmed);
 
   if (!Number.isNaN(seconds)) {
-    return seconds > 0 ? Math.round(seconds * 1000) : 0;
+    // Math.min also caps non-finite values (e.g. "1e400" -> Infinity).
+    return seconds > 0
+      ? Math.min(maxMs, Math.round(seconds * 1000))
+      : 0;
   }
 
   const date = Date.parse(trimmed);
 
   return Number.isFinite(date)
-    ? Math.max(0, date - now)
+    ? Math.min(maxMs, Math.max(0, date - now))
     : 0;
+}
+
+// Additive jitter: spreads retries upward to desynchronize clients without ever
+// dropping below the policy floor (the pre-jitter delay). The band is limited
+// both by BACKOFF_JITTER_FRACTION of the delay and by the remaining headroom to
+// maxMs, so a delay is never pushed above the configured maximum and a
+// server-requested Retry-After minimum is never reduced.
+export function applyBackoffJitter(
+  delay,
+  random = Math.random,
+  maxMs = MAX_BACKOFF_MS,
+  fraction = BACKOFF_JITTER_FRACTION
+) {
+  if (!(delay > 0)) return delay;
+
+  const span = Math.min(fraction * delay, Math.max(0, maxMs - delay));
+
+  // The injected random source is sampled once and normalized: a non-finite
+  // value (NaN, undefined, Infinity) or one outside [0, 1] falls back to the
+  // full-jitter upper bound (1) so an invalid source can never yield a NaN
+  // delay or silently disable backoff. Valid inputs are used as-is.
+  const sample = random();
+  const r = Number.isFinite(sample) && sample >= 0 && sample <= 1 ? sample : 1;
+
+  const jittered = delay + Math.round(span * r);
+
+  return Math.min(maxMs, Math.max(delay, jittered));
 }
 
 export function computeBackoffDelay(
@@ -560,7 +599,7 @@ export function computeBackoffDelay(
 
   const expDelay = baseDelayMs * (2 ** retryIndex);
   const retryAfter = response
-    ? retryAfterMs(response, now)
+    ? retryAfterMs(response, now, maxBackoffMs)
     : 0;
 
   const delay = Math.min(
@@ -638,6 +677,11 @@ export class RateGate extends DurableObject {
       typeof env?.__clearTimeout === "function"
         ? env.__clearTimeout
         : clearTimeout;
+
+    this.randomImpl =
+      typeof env?.__random === "function"
+        ? env.__random
+        : Math.random;
   }
 
   cleanTicket(ticket) {
@@ -1145,6 +1189,12 @@ export class RateGate extends DurableObject {
           {
             now: this.now(),
             maxBackoffMs: MAX_BACKOFF_MS,
+            jitterFn: (delay) =>
+              applyBackoffJitter(
+                delay,
+                this.randomImpl,
+                MAX_BACKOFF_MS
+              ),
           }
         );
 
