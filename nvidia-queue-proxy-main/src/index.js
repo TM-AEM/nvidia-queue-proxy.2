@@ -1339,7 +1339,7 @@ export class RateGate extends DurableObject {
         let headerTimeoutId = null;
         let headerTimedOut = false;
 
-        headerTimeoutId = setTimeout(() => {
+        headerTimeoutId = this.setTimeoutImpl(() => {
           headerTimedOut = true;
 
           upstreamAbortController.abort(
@@ -1360,7 +1360,7 @@ export class RateGate extends DurableObject {
           );
         } catch (fetchError) {
           if (headerTimeoutId !== null) {
-            clearTimeout(headerTimeoutId);
+            this.clearTimeoutImpl(headerTimeoutId);
             headerTimeoutId = null;
           }
 
@@ -1414,7 +1414,7 @@ export class RateGate extends DurableObject {
         }
 
         if (headerTimeoutId !== null) {
-          clearTimeout(headerTimeoutId);
+          this.clearTimeoutImpl(headerTimeoutId);
           headerTimeoutId = null;
         }
 

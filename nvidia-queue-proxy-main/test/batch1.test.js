@@ -6034,3 +6034,589 @@ test("AUDIT-17/F-01 control: the normal streaming completion path still releases
   assert.equal(counter.calls, 2, "the second request reaches the upstream");
   assert.equal(await res2.text(), "data: a\n\n");
 });
+
+// ==========================================
+// TASK 20 — deterministic injected-timer regression (header timeout)
+// ==========================================
+//
+// The upstream response-header timeout must be armed and cleared through the
+// same injected timer implementation the rest of the RateGate uses
+// (`__setTimeout` / `__clearTimeout`). Before TASK 19 this timer bypassed the
+// injection and used the real event loop directly, which made the header
+// timeout impossible to exercise deterministically. These tests drive the timer
+// exclusively through `createFakeTimers()` so they never depend on wall-clock
+// time.
+
+test("TASK 20: header timeout is armed through the injected timer and fires deterministically", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+  let upstreamSignalAborted = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    RESPONSE_HEADER_TIMEOUT_MS: 40,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: (url, opts) =>
+      new Promise((resolve, reject) => {
+        opts.signal.addEventListener("abort", () => {
+          upstreamSignalAborted = true;
+          reject(new DOMException("The operation was aborted", "AbortError"));
+        });
+      }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  const pending = rateGate.fetch(chatRequest());
+
+  // The header timer must be armed through the injected implementation.
+  await tick();
+  assert.equal(
+    timers.pendingCount(),
+    1,
+    "the header timeout must be armed via the injected setTimeout"
+  );
+
+  // No wall-clock wait: advance the virtual clock exactly to the timeout.
+  timers.advance(40);
+
+  const res = await pending;
+  assert.equal(res.status, 504, "the injected header timeout must yield 504");
+  assert.ok(upstreamSignalAborted, "the upstream fetch must be aborted on timeout");
+  assert.equal(timers.pendingCount(), 0, "the fired header timer must be cleared");
+});
+
+test("TASK 20: header timer is cleared through the injected timer on a fast success", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    RESPONSE_HEADER_TIMEOUT_MS: 40,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    // Upstream responds immediately with a complete (non-streamed) body.
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  const res = await rateGate.fetch(chatRequest());
+  assert.equal(res.status, 200);
+  assert.equal(await res.text(), "ok");
+
+  // The header timer armed before dispatch must be cleared after the response
+  // headers arrive; no stray injected timer may remain.
+  assert.equal(
+    timers.pendingCount(),
+    0,
+    "the header timer must be cleared via the injected clearTimeout on success"
+  );
+});
+
+// ==========================================
+// TASK 22 — isolated negative-path security tests
+// ==========================================
+//
+// These tests exercise the header-timeout negative path in isolation and assert
+// that the proxy's own 504 response never leaks the upstream credential, the
+// upstream `Authorization`, or network-topology headers. The proxy builds its
+// own JSON 504 body and must not relay anything from the upstream response.
+
+test("TASK 22: the 504 header-timeout response never leaks NVIDIA_API_KEY", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+  const SECRET = "nvapi-VERY-SECRET-KEY-0123456789";
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    RESPONSE_HEADER_TIMEOUT_MS: 40,
+    NVIDIA_API_KEY: SECRET,
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: (url, opts) =>
+      new Promise((resolve, reject) => {
+        opts.signal.addEventListener("abort", () =>
+          reject(new DOMException("aborted", "AbortError"))
+        );
+      }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const pending = rateGate.fetch(chatRequest());
+  await tick();
+  timers.advance(40);
+  const res = await pending;
+
+  assert.equal(res.status, 504);
+  assert.equal(res.headers.get("authorization"), null, "no Authorization header may be set on the proxy 504");
+  const body = await res.text();
+  assert.ok(!body.includes(SECRET), "the upstream API key must never appear in the 504 body");
+  assert.ok(!JSON.stringify([...res.headers]).includes(SECRET), "the upstream API key must never appear in 504 headers");
+});
+
+test("TASK 22: the 504 header-timeout path does not relay upstream topology headers", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    RESPONSE_HEADER_TIMEOUT_MS: 40,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    // The upstream handler arms headers but never resolves headers in time; the
+    // header timeout must fire and the proxy must return its OWN 504 headers.
+    __fetch: (url, opts) =>
+      new Promise((resolve, reject) => {
+        opts.signal.addEventListener("abort", () =>
+          reject(new DOMException("aborted", "AbortError"))
+        );
+      }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const pending = rateGate.fetch(chatRequest());
+  await tick();
+  timers.advance(40);
+  const res = await pending;
+
+  assert.equal(res.status, 504);
+  for (const name of [
+    "server",
+    "via",
+    "x-forwarded-for",
+    "x-real-ip",
+    "forwarded",
+    "x-amz-request-id",
+    "set-cookie",
+    "proxy-authenticate",
+  ]) {
+    assert.equal(res.headers.get(name), null, `topology/credential header "${name}" must not be relayed on the 504`);
+  }
+  assert.ok(res.headers.get("retry-after"), "the proxy 504 must still carry its own Retry-After header");
+  const body = await res.json();
+  assert.equal(body.error, "Upstream response header timeout");
+});
+
+test("TASK 22: the header-timeout 504 releases the queue slot and persists the timed-out attempt", async () => {
+  const clock = new FakeClock(0);
+  const ctx = makeRecordingCtx([]);
+  const timers = createFakeTimers();
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    RESPONSE_HEADER_TIMEOUT_MS: 40,
+    MAX_QUEUE_WAIT_MS: 1000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: (url, opts) =>
+      new Promise((resolve, reject) => {
+        opts.signal.addEventListener("abort", () =>
+          reject(new DOMException("aborted", "AbortError"))
+        );
+      }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const pending = rateGate.fetch(chatRequest());
+  await tick();
+  // Move wall-clock forward before the header timer fires so the timeout's
+  // completion timestamp differs from the pre-dispatch start timestamp; this
+  // makes the timeout-path rate-state write observably distinct.
+  clock.advance(500);
+  timers.advance(40);
+  const res = await pending;
+
+  assert.equal(res.status, 504);
+
+  // The 504 path must release the single queue slot so the instance can serve
+  // the next request (a leaked slot would stall the instance — F-01/F-03 class).
+  assert.equal(rateGate.activeTicket, null, "the queue slot must be released on the 504 timeout path");
+
+  // The timed-out attempt WAS dispatched, so its pre-dispatch rate-state write
+  // committed: durable state must hold exactly one in-window start plus a
+  // completion timestamp recorded when the timeout fired (t=500).
+  const durable = ctx.durable();
+  assert.ok(durable, "the dispatched-and-timed-out attempt must persist rate-state");
+  assert.equal(durable.starts.length, 1, "durable rate-state records the one timed-out attempt");
+  assert.equal(durable.starts[0], 0, "the timed-out attempt started at t=0");
+  assert.equal(durable.lastCompletionAt, 500, "the timeout records a completion timestamp at the timeout instant");
+});
+
+// ==========================================
+// TASK 25 / F-03 — pre-dispatch persistence-failure regression
+// ==========================================
+//
+// F-03 is the pre-dispatch analogue of F-01: the per-attempt `rate-state`
+// write that happens after a slot is acquired but before the upstream request
+// is dispatched. If that write rejects, the request must still release the
+// queue slot (the main handler catch does this) and must not leave the single
+// slot held. These tests pin that invariant.
+
+test("TASK 25/F-03: a pre-dispatch rate-state write failure releases the slot and returns 502", async () => {
+  const clock = new FakeClock(0);
+  const ctx = makeVaultCtx();
+  let dispatchCount = 0;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    MAX_QUEUE_WAIT_MS: 1000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      dispatchCount += 1;
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  let releaseCount = 0;
+  const originalRelease = rateGate.releaseSlot.bind(rateGate);
+  rateGate.releaseSlot = () => {
+    releaseCount += 1;
+    return originalRelease();
+  };
+
+  // Put #1 is the pre-dispatch per-attempt rate-state write. Fail it so the
+  // request never reaches the upstream, then assert the slot is released.
+  ctx.failPutAt(1);
+
+  const res = await rateGate.fetch(chatRequest());
+  await tick();
+
+  assert.equal(res.status, 502, "a pre-dispatch persistence failure surfaces as 502");
+  assert.equal(dispatchCount, 0, "the upstream must not be dispatched when the pre-dispatch write fails");
+  assert.equal(releaseCount, 1, "the slot must be released exactly once");
+  assert.equal(rateGate.activeTicket, null, "the queue slot must be free after the failure");
+});
+
+test("TASK 25/F-03 control: a subsequent request is admitted after a pre-dispatch failure", async () => {
+  const clock = new FakeClock(0);
+  const ctx = makeVaultCtx();
+  let dispatchCount = 0;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    MAX_QUEUE_WAIT_MS: 1000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      dispatchCount += 1;
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // First request: fail exactly the pre-dispatch write.
+  ctx.failPutAt(1);
+  const res1 = await rateGate.fetch(chatRequest());
+  assert.equal(res1.status, 502);
+  assert.equal(rateGate.activeTicket, null, "the slot is free after the pre-dispatch failure");
+
+  // Second request: no injected failure remains (failPutAt fires once), so it
+  // must be admitted and reach the upstream rather than waiting for the queue
+  // timeout.
+  const res2 = await rateGate.fetch(chatRequest());
+  assert.equal(await res2.text(), "ok");
+  assert.equal(res2.status, 200, "the queue must admit a new request after a pre-dispatch failure");
+  assert.equal(dispatchCount, 1, "the second request must reach the upstream");
+});
+
+// ==========================================
+// TASK 27 — strengthened F-03 RPM regression (fail-closed dispatch ordering)
+// ==========================================
+//
+// Invariant under test (approved, fail-closed): an upstream request must never
+// be dispatched unless its own pre-dispatch `rate-state` persistence write has
+// succeeded. These tests prove the ordering on a SINGLE RateGate instance with
+// ONE shared storage, using an interleaved event log, so a subsequent request
+// cannot leak past the RPM gate or reach the upstream without its own durable
+// write.
+//
+// Deliberately NOT asserted: that a *failed, undispatched* attempt must consume
+// an RPM slot. The implementation persists only after `waitForSlot` admits the
+// attempt, and a rejected `put` leaves durable `rate-state` untouched — so an
+// attempt that never dispatched correctly consumes no durable capacity. That is
+// the documented behavior, not a violation.
+
+// Storage wrapper that records durable put/get events and can reject specific
+// puts, while preserving full fidelity of the underlying store for `get`.
+function makeRecordingCtx(events) {
+  const store = new Map();
+  let putCount = 0;
+  let failAtPut = Infinity;
+
+  return {
+    storage: {
+      async get(key) {
+        events.push({ type: "get", key });
+        if (!store.has(key)) return undefined;
+        return JSON.parse(JSON.stringify(store.get(key)));
+      },
+      async put(key, value) {
+        putCount += 1;
+        const call = putCount;
+        events.push({ type: "put-attempt", key, call });
+        if (call === failAtPut) {
+          events.push({ type: "put-reject", key, call });
+          throw new Error("simulated pre-dispatch persistence failure");
+        }
+        store.set(key, JSON.parse(JSON.stringify(value)));
+        events.push({
+          type: "put-commit",
+          key,
+          call,
+          starts: JSON.parse(JSON.stringify(value?.starts ?? [])),
+        });
+      },
+    },
+    failPutAt(n) {
+      failAtPut = n;
+    },
+    // Direct read of the durable store, bypassing the event log, for final
+    // assertions about what actually survived.
+    durable() {
+      if (!store.has("rate-state")) return undefined;
+      return JSON.parse(JSON.stringify(store.get("rate-state")));
+    },
+  };
+}
+
+test("TASK 27/F-03/RPM: a rejected pre-dispatch write never dispatches and consumes no durable slot", async () => {
+  const clock = new FakeClock(0);
+  const events = [];
+  const ctx = makeRecordingCtx(events);
+  let dispatchCount = 0;
+
+  const env = {
+    RPM: 1, // A single admitted attempt fills the window.
+    COOLDOWN_MS: 0,
+    MAX_QUEUE_WAIT_MS: 1000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      dispatchCount += 1;
+      events.push({ type: "dispatch", at: clock.now() });
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Fail exactly the first pre-dispatch rate-state write.
+  ctx.failPutAt(1);
+
+  const res = await rateGate.fetch(chatRequest());
+  await tick();
+
+  assert.equal(res.status, 502, "a rejected pre-dispatch write surfaces as 502");
+  assert.equal(dispatchCount, 0, "no upstream dispatch may occur without a successful persistence write");
+
+  // Event ordering: the put was attempted and rejected BEFORE any dispatch.
+  const firstDispatch = events.findIndex((e) => e.type === "dispatch");
+  const firstCommit = events.findIndex((e) => e.type === "put-commit");
+  const firstReject = events.findIndex((e) => e.type === "put-reject");
+  assert.equal(firstDispatch, -1, "the event log must contain no dispatch at all");
+  assert.ok(firstReject !== -1, "the pre-dispatch put must have been rejected");
+  assert.equal(firstCommit, -1, "no put may commit when the first write is rejected");
+
+  // The only write attempted in this request is the failed pre-dispatch write;
+  // it rejected the rate-state key itself and nothing was recorded after it.
+  const putAttempts = events.filter((e) => e.type === "put-attempt");
+  assert.equal(putAttempts.length, 1, "exactly one write must be attempted");
+  assert.equal(putAttempts[0].key, "rate-state", "the attempted write must be the rate-state write");
+  assert.equal(putAttempts[0].call, 1, "the attempted write must be the first put call");
+  const rejected = events[firstReject];
+  assert.equal(rejected.key, "rate-state", "the rejection must be for the rate-state write");
+  assert.equal(
+    firstReject,
+    events.length - 1,
+    "the rejected write must be the terminal event (nothing committed or dispatched after it)"
+  );
+
+  // Durable state must be untouched: the rejected write throws before the store
+  // is mutated, so rate-state was never created. The undispatched attempt
+  // therefore consumed no slot.
+  const durable = ctx.durable();
+  assert.equal(
+    durable,
+    undefined,
+    "a failed, undispatched attempt must not create durable rate-state or consume RPM capacity"
+  );
+
+  // The slot must be free so the instance can serve the next request.
+  assert.equal(rateGate.activeTicket, null, "the queue slot must be released after the failure");
+});
+
+test("TASK 27/F-03/RPM: subsequent request on the same instance persists before dispatch and consumes exactly one slot", async () => {
+  const clock = new FakeClock(0);
+  const events = [];
+  const ctx = makeRecordingCtx(events);
+  let dispatchCount = 0;
+
+  const env = {
+    RPM: 1,
+    COOLDOWN_MS: 0,
+    MAX_QUEUE_WAIT_MS: 1000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      dispatchCount += 1;
+      events.push({ type: "dispatch", at: clock.now() });
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  // SAME RateGate + SAME storage across the whole sequence.
+  const rateGate = new RateGate(ctx, env);
+
+  // Request 1: fail its pre-dispatch write. It must not dispatch.
+  ctx.failPutAt(1);
+  const res1 = await rateGate.fetch(chatRequest());
+  assert.equal(res1.status, 502);
+  assert.equal(dispatchCount, 0, "request 1 must not dispatch after a rejected write");
+  assert.equal(rateGate.activeTicket, null, "the slot is freed after request 1 fails");
+
+  // Reset the event boundary so ordering of request 2 is unambiguous.
+  events.length = 0;
+
+  // Request 2: no failure is queued now (failPutAt fires once), so it must
+  // commit its own pre-dispatch write BEFORE it is dispatched.
+  const res2 = await rateGate.fetch(chatRequest());
+  assert.equal(await res2.text(), "ok");
+  assert.equal(res2.status, 200, "request 2 must be admitted on the same instance");
+  assert.equal(dispatchCount, 1, "exactly one dispatch across the sequence (request 2 only)");
+
+  // Strict ordering for request 2: commit(rate-state) must precede dispatch.
+  const commitIdx = events.findIndex(
+    (e) => e.type === "put-commit" && e.key === "rate-state"
+  );
+  const dispatchIdx = events.findIndex((e) => e.type === "dispatch");
+  assert.ok(commitIdx !== -1, "request 2 must commit its pre-dispatch rate-state write");
+  assert.ok(dispatchIdx !== -1, "request 2 must dispatch");
+  assert.ok(
+    commitIdx < dispatchIdx,
+    "request 2 must persist rate-state BEFORE dispatching upstream"
+  );
+
+  // Request 2's durable write recorded exactly one attempt timestamp.
+  const committed = events[commitIdx];
+  assert.equal(
+    committed.starts.length,
+    1,
+    "request 2's successful write records exactly one attempt start"
+  );
+
+  // Final durable state reflects only request 2 (request 1 never persisted).
+  const durable = ctx.durable();
+  assert.equal(
+    durable.starts.length,
+    1,
+    "durable rate-state holds exactly the one dispatched attempt"
+  );
+  assert.equal(
+    durable.starts[0],
+    committed.starts[0],
+    "the durable start matches the value persisted before dispatch"
+  );
+});
+
+test("TASK 27/F-03/RPM: the RPM gate still blocks a third request on the same instance after a failure+success sequence", async () => {
+  const clock = new FakeClock(0);
+  const events = [];
+  const ctx = makeRecordingCtx(events);
+  const dispatches = [];
+
+  const env = {
+    RPM: 1, // Only one dispatched attempt per rolling 60s window.
+    COOLDOWN_MS: 0,
+    MAX_QUEUE_WAIT_MS: 1000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __fetch: async () => {
+      dispatches.push(clock.now());
+      events.push({ type: "dispatch", at: clock.now() });
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Request 1: pre-dispatch write fails -> no dispatch, no durable slot.
+  ctx.failPutAt(1);
+  const res1 = await rateGate.fetch(chatRequest());
+  assert.equal(res1.status, 502);
+  assert.equal(dispatches.length, 0, "request 1 must not dispatch");
+
+  // Request 2: succeeds and dispatches at t=0, consuming the single RPM slot.
+  const res2 = await rateGate.fetch(chatRequest());
+  await res2.text();
+  assert.equal(res2.status, 200);
+  assert.equal(dispatches.length, 1, "request 2 dispatches once");
+  assert.equal(dispatches[0], 0, "request 2 dispatches at t=0");
+
+  // Request 3 at the same instant: the RPM window is full (RPM=1, one start at
+  // t=0), so the gate must force a wait until that start ages out of the
+  // 60s window. The FakeClock makes that wait deterministic and instant.
+  const res3 = await rateGate.fetch(chatRequest());
+  await res3.text();
+  assert.equal(res3.status, 200);
+  assert.equal(dispatches.length, 2, "request 3 eventually dispatches once admitted");
+  assert.ok(
+    dispatches[1] >= 60_000,
+    "request 3 must wait until the prior RPM start ages out of the 60s window"
+  );
+  assert.equal(
+    dispatches[1] - dispatches[0],
+    60_000,
+    "the RPM gate releases the third dispatch exactly one window after the second"
+  );
+
+  // Durable rolling window after request 3: the t=0 start has aged out of the
+  // 60s window (60000 - 0 is not < 60000), so durable state holds only
+  // request 3's start at t=60000. Request 1 never persisted.
+  const durable = ctx.durable();
+  assert.equal(
+    durable.starts.length,
+    1,
+    "durable rolling window holds only the in-window dispatched attempt"
+  );
+  assert.equal(
+    durable.starts[0],
+    60_000,
+    "the durable start is request 3's dispatch timestamp"
+  );
+});
