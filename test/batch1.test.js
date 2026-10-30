@@ -33,6 +33,7 @@ const {
   BodyTooLargeError,
   BodyReadTimeoutError,
   AggregateBodyLimitExceededError,
+  timingSafeStringEqual,
   default: worker,
 } = await import("../src/index.js");
 
@@ -6893,4 +6894,120 @@ test("TASK 35/RPM: client cancel during streaming releases the slot once, promot
   const durable = ctx.durable();
   assert.ok(durable, "durable rate-state must exist");
   assert.equal(durable.starts.length, 2, "exactly two dispatched attempts are recorded");
+});
+
+// ==========================================
+// REM-02: Constant-time proxy authentication tests
+// ==========================================
+
+test("REM-02: timingSafeStringEqual returns true only for matching strings", async () => {
+  assert.equal(await timingSafeStringEqual("super-secret-key-123", "super-secret-key-123"), true);
+  assert.equal(await timingSafeStringEqual("", ""), true);
+});
+
+test("REM-02: timingSafeStringEqual rejects mismatched and unequal-length strings safely", async () => {
+  // Mismatched with same length
+  assert.equal(await timingSafeStringEqual("super-secret-key-123", "super-secret-key-124"), false);
+  // Unequal length: shorter
+  assert.equal(await timingSafeStringEqual("super-secret-key-12", "super-secret-key-123"), false);
+  // Unequal length: longer
+  assert.equal(await timingSafeStringEqual("super-secret-key-1234", "super-secret-key-123"), false);
+  // Empty vs non-empty
+  assert.equal(await timingSafeStringEqual("", "super-secret-key-123"), false);
+  assert.equal(await timingSafeStringEqual("super-secret-key-123", ""), false);
+  // Non-string arguments
+  assert.equal(await timingSafeStringEqual(null, "super-secret-key-123"), false);
+  assert.equal(await timingSafeStringEqual(undefined, "super-secret-key-123"), false);
+  assert.equal(await timingSafeStringEqual(12345, 12345), false);
+});
+
+test("REM-02: worker rejects mismatched or unequal-length proxy keys with 401", async () => {
+  const env = {
+    PROXY_KEY: "expected-secret-key-456",
+    NVIDIA_API_KEY: "nvidia-secret-789",
+    RATE_GATE: { idFromName: () => "id", get: () => ({ fetch: () => new Response("ok") }) },
+  };
+
+  // Same length mismatch
+  const res1 = await worker.fetch(
+    new Request("https://proxy.local/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: "Bearer expected-secret-key-457" },
+    }),
+    env
+  );
+  assert.equal(res1.status, 401, "mismatched key of same length must return 401");
+
+  // Shorter key
+  const res2 = await worker.fetch(
+    new Request("https://proxy.local/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: "Bearer expected-secret" },
+    }),
+    env
+  );
+  assert.equal(res2.status, 401, "shorter key must return 401");
+
+  // Longer key
+  const res3 = await worker.fetch(
+    new Request("https://proxy.local/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: "Bearer expected-secret-key-456-longer" },
+    }),
+    env
+  );
+  assert.equal(res3.status, 401, "longer key must return 401");
+
+  // Missing or empty key
+  const res4 = await worker.fetch(
+    new Request("https://proxy.local/v1/chat/completions", {
+      method: "POST",
+    }),
+    env
+  );
+  assert.equal(res4.status, 401, "missing authorization must return 401");
+
+  // Valid key via Authorization: Bearer
+  const res5 = await worker.fetch(
+    new Request("https://proxy.local/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: "Bearer expected-secret-key-456" },
+    }),
+    env
+  );
+  assert.equal(res5.status, 200, "valid Bearer key must be accepted");
+
+  // Valid key via x-proxy-key header
+  const res6 = await worker.fetch(
+    new Request("https://proxy.local/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-proxy-key": "expected-secret-key-456" },
+    }),
+    env
+  );
+  assert.equal(res6.status, 200, "valid x-proxy-key must be accepted");
+});
+
+test("REM-02: worker preserves 500 when PROXY_KEY or NVIDIA_API_KEY is missing from environment", async () => {
+  // Missing PROXY_KEY
+  const resMissingProxy = await worker.fetch(
+    new Request("https://proxy.local/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: "Bearer any-key" },
+    }),
+    { NVIDIA_API_KEY: "nvidia-secret-789" }
+  );
+  assert.equal(resMissingProxy.status, 500, "missing PROXY_KEY in env must return 500");
+  assert.equal(await resMissingProxy.text(), "Server configuration error");
+
+  // Missing NVIDIA_API_KEY
+  const resMissingNvidia = await worker.fetch(
+    new Request("https://proxy.local/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: "Bearer test-key" },
+    }),
+    { PROXY_KEY: "test-key" }
+  );
+  assert.equal(resMissingNvidia.status, 500, "missing NVIDIA_API_KEY in env must return 500");
+  assert.equal(await resMissingNvidia.text(), "Server configuration error");
 });

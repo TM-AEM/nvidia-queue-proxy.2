@@ -78,7 +78,7 @@ readiness" for details.
 - **Secrets.** `PROXY_KEY` and `NVIDIA_API_KEY` must be present for `POST /v1/*`
   to work; see "Configuration".
 
-Reproducible install and local commands (run from `nvidia-queue-proxy-main/`):
+Reproducible install and local commands (run from repository root):
 
 ```bash
 # Install exactly the locked dependency tree (npm; lockfile version 3)
@@ -557,7 +557,7 @@ Cancellation is best-effort and bounded in both directions:
 | `413` / `408` / `400` on the request body | Body too large, too slow, or unreadable | Compare against `MAX_BODY_BYTES` / `REQUEST_BODY_TIMEOUT_MS`; see "Request body handling". |
 | `/ready` returns `503` | A required binding is missing | Inspect the boolean `checks` object (`proxy_key`, `upstream_key`, `rate_gate`); `/ready` does not test upstream reachability. |
 
-Local diagnostics (from `nvidia-queue-proxy-main/`):
+Local diagnostics (from repository root):
 
 ```bash
 # Reproduce configuration and queue behavior in the local test runtime
@@ -625,9 +625,8 @@ Operations notes:
 
 Complete these in order for an authorized release:
 
-1. **Local tests** (this task: done) — `npm test` from
-   `nvidia-queue-proxy-main/`.
-2. **Wrangler dry-run** (this task: done) — `npx wrangler deploy --dry-run`.
+1. **Local tests** (this task: done) — `npm test` from repository root.
+2. **Wrangler dry-run** (this task: done) — `npm run deploy:dry-run`.
 3. **Authorized deployment** (this task: **NOT performed**) — deploy via
    `npm run deploy` only with explicit authorization.
 4. **Post-deployment smoke test** (this task: **NOT performed**) — run the
@@ -644,15 +643,12 @@ Complete these in order for an authorized release:
 The repository ships a GitHub Actions workflow
 (`.github/workflows/deploy.yml`) that both tests and deploys the Worker:
 
-- **Triggers.** A push to `main` that touches `nvidia-queue-proxy-main/**` or the
+- **Triggers.** A push to `main` that touches `src/**`, `test/**`, `wrangler.jsonc`, `package.json`, or the
   workflow file itself, plus manual `workflow_dispatch`. It does **not** deploy
   on pull requests or on pushes to other branches.
-- **Install.** Dependencies are installed with
-  `npm install --no-audit --no-fund` (not `npm ci`), so the workflow does not use
-  the reproducible, lockfile-strict install.
-- **Checks.** `npm test` and `npx wrangler deploy --dry-run` run before deploy.
+- **Install.** Dependencies are installed reproducibly with `npm ci`.
+- **Checks.** `npm test` and `npm run deploy:dry-run` run before deploy.
 - **Deploy.** On a qualifying push to `main`, and only if the checks pass, the
-  workflow runs `npx wrangler deploy` using the `CLOUDFLARE_API_TOKEN` and
-  `CLOUDFLARE_ACCOUNT_ID` repository secrets. This is an automatic production
-  deployment; the "Release verification checklist" above is the manual,
-  local-first equivalent and is not what CI performs.
+  workflow runs `npm run deploy` using the `CLOUDFLARE_API_TOKEN` and
+  `CLOUDFLARE_ACCOUNT_ID` repository secrets.
+- **Smoke test.** An automated post-deploy smoke test verifies `/health` and `/ready` against the deployed endpoint.

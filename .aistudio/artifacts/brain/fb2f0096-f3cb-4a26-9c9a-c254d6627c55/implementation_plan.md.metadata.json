@@ -1,0 +1,6 @@
+{
+  "summary":  "Remediation and consolidation plan for the NVIDIA Queue Proxy, establishing a single authoritative Cloudflare Worker at root, incorporating all audited queue, rate-limiting, and security invariants, and maintaining safe operational and testing workflows.",
+  "updatedAt":  "2026-10-30T09:12:11.466767009Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

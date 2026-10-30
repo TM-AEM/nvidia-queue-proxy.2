@@ -1,4 +1,3 @@
-
 name: Test and Deploy NVIDIA Queue Proxy
 
 on:
@@ -6,7 +5,11 @@ on:
     branches:
       - main
     paths:
-      - "nvidia-queue-proxy-main/**"
+      - "src/**"
+      - "test/**"
+      - "wrangler.jsonc"
+      - "package.json"
+      - "package-lock.json"
       - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
@@ -28,18 +31,19 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: "npm"
 
       - name: Install dependencies
-        working-directory: nvidia-queue-proxy-main
-        run: npm install --no-audit --no-fund
+        run: npm ci
 
-      - name: Run tests
-        working-directory: nvidia-queue-proxy-main
+      - name: TypeScript typecheck
+        run: npm run lint
+
+      - name: Run unit and workerd runtime tests
         run: npm test
 
       - name: Validate deployment bundle
-        working-directory: nvidia-queue-proxy-main
-        run: npx wrangler deploy --dry-run
+        run: npm run deploy:dry-run
 
       - name: Check required Cloudflare secrets
         env:
@@ -56,8 +60,34 @@ jobs:
           fi
 
       - name: Deploy Worker
-        working-directory: nvidia-queue-proxy-main
+        id: deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx wrangler deploy
+        run: npm run deploy
+
+      - name: Post-deployment health & readiness smoke test
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+        run: |
+          if [ -z "$WORKER_URL" ]; then
+            echo "WORKER_URL secret not set; skipping live smoke test."
+            exit 0
+          fi
+
+          echo "Starting smoke check on $WORKER_URL..."
+          # Test /health (liveness)
+          HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$WORKER_URL/health" || echo "failed")
+          if [ "$HEALTH_STATUS" != "200" ]; then
+            echo "::error::Liveness probe /health failed with HTTP $HEALTH_STATUS"
+            exit 1
+          fi
+          echo "Liveness check /health passed (HTTP 200)."
+
+          # Test /ready (readiness)
+          READY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$WORKER_URL/ready" || echo "failed")
+          if [ "$READY_STATUS" != "200" ]; then
+            echo "::error::Readiness probe /ready failed with HTTP $READY_STATUS"
+            exit 1
+          fi
+          echo "Readiness check /ready passed (HTTP 200)."
