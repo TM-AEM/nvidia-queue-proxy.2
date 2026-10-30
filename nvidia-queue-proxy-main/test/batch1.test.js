@@ -6620,3 +6620,277 @@ test("TASK 27/F-03/RPM: the RPM gate still blocks a third request on the same in
     "the durable start is request 3's dispatch timestamp"
   );
 });
+
+// ==========================================
+// TASK 35 — F-03/RPM retry & timeout interaction coverage
+// ==========================================
+//
+// These tests close three coverage gaps identified in TASK 34:
+//   A. Each dispatched upstream 429 retry consumes an additional RPM slot and
+//      persists its rate-state before dispatching; a retry whose pre-dispatch
+//      write fails does not dispatch and leaves no durable RPM entry for it.
+//   B. The per-attempt header-timeout timer is owned by the active attempt and
+//      cleared before a retry proceeds; a timeout on the retry attempt ends the
+//      request with 504 (no further dispatch), releases the slot once, and
+//      durable state reflects only the attempts actually dispatched.
+//   C. Client cancellation during streaming (with injected timers) propagates
+//      the abort upstream, runs streaming cleanup, releases the active slot
+//      exactly once, promotes a waiting request only after release, leaves no
+//      injected timer pending, and neither removes nor duplicates RPM entries.
+
+test("TASK 35/RPM: each dispatched 429 retry consumes another RPM slot and persists before dispatch", async () => {
+  const clock = new FakeClock(0);
+  const events = [];
+  const ctx = makeRecordingCtx(events);
+  let fetches = 0;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    MAX_QUEUE_WAIT_MS: 1000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __random: () => 0,
+    __fetch: async () => {
+      fetches += 1;
+      events.push({ type: "dispatch", n: fetches, at: clock.now() });
+      return fetches === 1
+        ? new Response("", { status: 429 })
+        : new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+  assert.equal(await res.text(), "ok");
+  assert.equal(res.status, 200);
+  assert.equal(fetches, 2, "one 429 then one successful retry");
+
+  const dispatches = events.filter((e) => e.type === "dispatch");
+  assert.equal(dispatches.length, 2, "two dispatched attempts (initial + retry)");
+
+  // Each dispatch must be preceded by its own rate-state commit.
+  for (const dispatch of dispatches) {
+    const dIdx = events.indexOf(dispatch);
+    const priorCommit = events
+      .slice(0, dIdx)
+      .reverse()
+      .find((e) => e.type === "put-commit" && e.key === "rate-state");
+    assert.ok(
+      priorCommit,
+      `dispatch n=${dispatch.n} must have a rate-state commit before it`
+    );
+  }
+
+  // Durable state records exactly the two dispatched attempts' starts.
+  const durable = ctx.durable();
+  assert.ok(durable, "durable rate-state must exist");
+  assert.equal(durable.starts.length, 2, "both dispatched attempts consumed an RPM slot");
+});
+
+test("TASK 35/RPM: a retry whose pre-dispatch write fails does not dispatch and records no slot", async () => {
+  const clock = new FakeClock(0);
+  const events = [];
+  const ctx = makeRecordingCtx(events);
+  let fetches = 0;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    MAX_QUEUE_WAIT_MS: 1000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __random: () => 0,
+    __fetch: async () => {
+      fetches += 1;
+      events.push({ type: "dispatch", n: fetches, at: clock.now() });
+      return fetches === 1
+        ? new Response("", { status: 429 })
+        : new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  // Put call order for a 429 retry: 1 = initial pre-dispatch, 2 = 429 body
+  // completion, 3 = retry pre-dispatch. Fail call 3 so the retry cannot
+  // dispatch.
+  ctx.failPutAt(3);
+
+  const res = await rateGate.fetch(chatRequest());
+  assert.equal(res.status, 502, "a retry pre-dispatch persistence failure surfaces as 502");
+  assert.equal(fetches, 1, "the retry must not dispatch when its pre-dispatch write fails");
+
+  const reject = events.find((e) => e.type === "put-reject");
+  assert.ok(reject, "the retry pre-dispatch write must be rejected");
+  assert.equal(reject.key, "rate-state", "the rejected write is the rate-state write");
+
+  // Only the first dispatched attempt is durable; the failed retry added none.
+  const durable = ctx.durable();
+  assert.ok(durable, "durable rate-state must exist from the first attempt");
+  assert.equal(durable.starts.length, 1, "the failed retry consumed no durable RPM slot");
+
+  assert.equal(rateGate.activeTicket, null, "the queue slot must be released after the failure");
+});
+
+test("TASK 35/RPM: header timeout on a 429 retry ends the request, clears both timers, releases the slot once", async () => {
+  const clock = new FakeClock(0);
+  const events = [];
+  const ctx = makeRecordingCtx(events);
+  const timers = createFakeTimers();
+  let fetches = 0;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    MAX_QUEUE_WAIT_MS: 1000,
+    RESPONSE_HEADER_TIMEOUT_MS: 40,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __random: () => 0,
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async (url, opts) => {
+      fetches += 1;
+      const n = fetches;
+      events.push({ type: "dispatch", n, at: clock.now(), pending: timers.pendingCount() });
+      if (n === 1) {
+        // First attempt returns 429 immediately; its header timer is cleared
+        // before the retry proceeds.
+        return new Response("", { status: 429 });
+      }
+      // Retry attempt never delivers a response header; the per-attempt header
+      // timer must abort it.
+      return new Promise((resolve, reject) => {
+        opts.signal.addEventListener("abort", () =>
+          reject(new DOMException("aborted", "AbortError"))
+        );
+      });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const pending = rateGate.fetch(chatRequest());
+  await tick();
+
+  // At this point attempt 1 (429) has been dispatched and the retry has begun
+  // after the backoff sleep; each dispatch had exactly its own +1 timer armed
+  // (the previous attempt's timer was cleared before the retry).
+  const dispatchEvents = events.filter((e) => e.type === "dispatch");
+  assert.equal(dispatchEvents.length, 2, "initial + retry dispatched before the timeout");
+  assert.equal(dispatchEvents[0].pending, 1, "attempt 1 arms exactly one header timer");
+  assert.equal(dispatchEvents[1].pending, 1, "retry arms its own timer after the prior is cleared");
+
+  clock.advance(500);
+  timers.advance(40);
+  const res = await pending;
+  assert.equal(res.status, 504, "a header timeout on the retry surfaces as 504");
+  assert.equal(fetches, 2, "no further dispatch after the retry times out");
+  assert.equal(timers.pendingCount(), 0, "no injected header/idle timer may remain pending");
+  assert.equal(rateGate.activeTicket, null, "the slot is released on the timeout path");
+
+  // Both dispatched attempts are durable; the timed-out retry records the
+  // timeout instant as its completion (start t=1000, timeout at t=1500).
+  const durable = ctx.durable();
+  assert.ok(durable, "durable rate-state must exist");
+  assert.equal(durable.starts.length, 2, "durable records both dispatched attempts");
+  assert.deepEqual(durable.starts, [0, 1000], "attempts were dispatched at t=0 and t=1000");
+  assert.equal(durable.lastCompletionAt, 1500, "the retry's timeout records the completion instant");
+});
+
+test("TASK 35/RPM: client cancel during streaming releases the slot once, promotes a waiter, and preserves RPM entries", async () => {
+  const clock = new FakeClock(0);
+  const events = [];
+  const ctx = makeRecordingCtx(events);
+  const timers = createFakeTimers();
+  let fetches = 0;
+
+  const env = {
+    RPM: 100,
+    COOLDOWN_MS: 0,
+    MAX_QUEUE_WAIT_MS: 100000,
+    RESPONSE_HEADER_TIMEOUT_MS: 1000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __random: () => 0,
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => {
+      fetches += 1;
+      const n = fetches;
+      events.push({ type: "dispatch", n, at: clock.now() });
+      if (n === 1) {
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("chunk-1"));
+            },
+            cancel() {
+              events.push({ type: "upstream-cancel", n: 1, at: clock.now() });
+            },
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response("ok-2", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const abortCtrl = new AbortController();
+
+  // Request 1 starts streaming and consumes the slot.
+  const res1 = await rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "1",
+      signal: abortCtrl.signal,
+    })
+  );
+  assert.equal(res1.status, 200);
+  const reader = res1.body.getReader();
+  const chunk = await reader.read();
+  assert.equal(new TextDecoder().decode(chunk.value), "chunk-1");
+  assert.equal(timers.pendingCount(), 0, "no header timeout remains armed once headers arrived");
+
+  // Request 2 queues behind the active slot.
+  const res2p = rateGate.fetch(
+    new Request("https://proxy.internal/v1/chat/completions", {
+      method: "POST",
+      body: "2",
+    })
+  );
+  await tick();
+  assert.equal(rateGate.waitingQueue.length, 1, "request 2 is waiting behind the active slot");
+  assert.equal(fetches, 1, "request 2 has not dispatched while request 1 holds the slot");
+
+  // Client cancels the streaming response.
+  abortCtrl.abort();
+  for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+
+  const res2 = await res2p;
+  assert.equal(res2.status, 200);
+  assert.equal(await res2.text(), "ok-2");
+
+  // The upstream cancel was observed, and the waiter dispatched only after it.
+  const cancelIdx = events.findIndex((e) => e.type === "upstream-cancel");
+  const dispatch2Idx = events.findIndex((e) => e.type === "dispatch" && e.n === 2);
+  assert.ok(cancelIdx !== -1, "client cancel must propagate to the upstream stream");
+  assert.ok(dispatch2Idx !== -1, "the queued request must be promoted and dispatched");
+  assert.ok(
+    cancelIdx < dispatch2Idx,
+    "the waiting request dispatches only after the active slot is released"
+  );
+
+  assert.equal(timers.pendingCount(), 0, "no injected timer may remain pending after cleanup");
+  assert.equal(rateGate.activeTicket, null, "the slot is free once the promoted request finishes");
+
+  // Exactly the two dispatched attempts are durable: none removed/duplicated.
+  const durable = ctx.durable();
+  assert.ok(durable, "durable rate-state must exist");
+  assert.equal(durable.starts.length, 2, "exactly two dispatched attempts are recorded");
+});
