@@ -29,6 +29,7 @@ jobs:
     # that branch's source to the production Worker.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Assert canonical main ref
         run: |

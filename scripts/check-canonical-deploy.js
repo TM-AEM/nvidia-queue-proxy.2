@@ -34,7 +34,7 @@ function walk(dir, files = []) {
 const files = walk(repoRoot);
 const rel = (f) => relative(repoRoot, f);
 
-const wranglerConfigs = files.filter((f) => WRANGLER_NAMES.includes(f.split("/").pop()));
+const wranglerConfigs = files.filter((f) => WRANGLER_NAMES.includes(f.split(sep).pop()));
 const workerEntries = files.filter(
   (f) => rel(f).startsWith(`src${sep}`) && WORKER_ENTRY_NAMES.has(f.split(sep).pop())
 );
