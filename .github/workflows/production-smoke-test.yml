@@ -39,6 +39,10 @@ jobs:
 
           CLEAN_URL=$(node -e '
             const raw = process.env.WORKER_URL || "";
+            if (!raw || typeof raw !== "string") {
+              console.error("::error::Missing required secret WORKER_URL");
+              process.exit(1);
+            }
             let u;
             try {
               u = new URL(raw);
@@ -50,12 +54,38 @@ jobs:
               console.error("::error::WORKER_URL must use https protocol");
               process.exit(1);
             }
-            if (!/^[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.workers\.dev$/.test(u.hostname)) {
-              console.error("::error::WORKER_URL hostname is not an authorized workers.dev domain");
+            if (u.hostname !== "nvidia-queue-proxy-2.5s5k7kk.workers.dev") {
+              console.error("::error::WORKER_URL hostname is not authorized");
+              process.exit(1);
+            }
+            // Check for explicit ports (including default 443)
+            const hostPart = raw.replace(/^https:\/\//, "").split("/")[0].split("?")[0].split("#")[0];
+            if (hostPart.includes(":") || u.port !== "") {
+              console.error("::error::WORKER_URL must not specify an explicit port");
+              process.exit(1);
+            }
+            if (u.username !== "" || u.password !== "") {
+              console.error("::error::WORKER_URL must not contain credentials");
+              process.exit(1);
+            }
+            if (u.pathname !== "" && u.pathname !== "/") {
+              console.error("::error::WORKER_URL must not contain a path component");
+              process.exit(1);
+            }
+            if (u.search !== "") {
+              console.error("::error::WORKER_URL must not contain a query string");
+              process.exit(1);
+            }
+            if (u.hash !== "") {
+              console.error("::error::WORKER_URL must not contain a fragment");
               process.exit(1);
             }
             console.log(u.origin);
           ')
+
+          if [ -z "$CLEAN_URL" ]; then
+            exit 1
+          fi
 
           echo "target_url=${CLEAN_URL}" >> "$GITHUB_OUTPUT"
           echo "WORKER_URL validated successfully: authorized https workers.dev domain."
@@ -64,11 +94,24 @@ jobs:
         env:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
-          HTTP_CODE=$(curl -s -S -o /tmp/health_body.json -w "%{http_code}" --max-time 10 "${TARGET_URL}/health" || echo "curl_failed")
-          if [ "$HTTP_CODE" = "curl_failed" ]; then
-            echo "::error::Network error: failed to connect to /health within timeout"
+          BODY_FILE=$(mktemp)
+          STATUS_FILE=$(mktemp)
+          trap 'rm -f "$BODY_FILE" "$STATUS_FILE"' EXIT
+
+          CURL_EXIT=0
+          curl -s -S \
+            --connect-timeout 5 \
+            --max-time 10 \
+            -o "$BODY_FILE" \
+            -w "%{http_code}" \
+            "${TARGET_URL}/health" > "$STATUS_FILE" || CURL_EXIT=$?
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "::error::Transport error: curl failed with exit code $CURL_EXIT on /health"
             exit 1
           fi
+
+          HTTP_CODE=$(cat "$STATUS_FILE")
           if [ "$HTTP_CODE" != "200" ]; then
             echo "::error::Health probe failed: expected HTTP 200, received HTTP $HTTP_CODE"
             exit 1
@@ -77,27 +120,40 @@ jobs:
           node -e '
             const fs = require("fs");
             try {
-              const body = fs.readFileSync("/tmp/health_body.json", "utf8");
-              const data = JSON.parse(body);
+              const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
               if (data.ok === true) process.exit(0);
               console.error("::error::Health check failed: expected payload {ok: true}");
               process.exit(1);
-            } catch (err) {
+            } catch {
               console.error("::error::Health check failed: response was not valid JSON");
               process.exit(1);
             }
-          '
-          echo "Check A passed: HTTP 200, valid JSON payload with ok=true"
+          ' "$BODY_FILE"
+
+          echo "Check A passed: HTTP 200, valid payload with ok=true"
 
       - name: "Check B — Readiness Probe (GET /ready)"
         env:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
-          HTTP_CODE=$(curl -s -S -o /tmp/ready_body.json -w "%{http_code}" --max-time 10 "${TARGET_URL}/ready" || echo "curl_failed")
-          if [ "$HTTP_CODE" = "curl_failed" ]; then
-            echo "::error::Network error: failed to connect to /ready within timeout"
+          BODY_FILE=$(mktemp)
+          STATUS_FILE=$(mktemp)
+          trap 'rm -f "$BODY_FILE" "$STATUS_FILE"' EXIT
+
+          CURL_EXIT=0
+          curl -s -S \
+            --connect-timeout 5 \
+            --max-time 10 \
+            -o "$BODY_FILE" \
+            -w "%{http_code}" \
+            "${TARGET_URL}/ready" > "$STATUS_FILE" || CURL_EXIT=$?
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "::error::Transport error: curl failed with exit code $CURL_EXIT on /ready"
             exit 1
           fi
+
+          HTTP_CODE=$(cat "$STATUS_FILE")
           if [ "$HTTP_CODE" != "200" ]; then
             echo "::error::Readiness probe failed: expected HTTP 200, received HTTP $HTTP_CODE"
             exit 1
@@ -106,36 +162,50 @@ jobs:
           node -e '
             const fs = require("fs");
             try {
-              const body = fs.readFileSync("/tmp/ready_body.json", "utf8");
-              const data = JSON.parse(body);
+              const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
               const checks = data.checks || {};
-              const valid = data.ready === true &&
-                            checks.proxy_key === true &&
-                            checks.upstream_key === true &&
-                            checks.rate_gate === true;
-              if (valid) process.exit(0);
+              if (data.ready === true &&
+                  checks.proxy_key === true &&
+                  checks.upstream_key === true &&
+                  checks.rate_gate === true) {
+                process.exit(0);
+              }
               console.error("::error::Readiness check failed: one or more required bindings are not ready");
               process.exit(1);
-            } catch (err) {
+            } catch {
               console.error("::error::Readiness check failed: response was not valid JSON");
               process.exit(1);
             }
-          '
+          ' "$BODY_FILE"
+
           echo "Check B passed: HTTP 200, all checks ready (proxy_key, upstream_key, rate_gate)"
 
       - name: "Check C — Unauthenticated Route Security (GET /v1/models)"
         env:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
-          HTTP_CODE=$(curl -s -S -o /dev/null -w "%{http_code}" --max-time 10 "${TARGET_URL}/v1/models" || echo "curl_failed")
-          if [ "$HTTP_CODE" = "curl_failed" ]; then
-            echo "::error::Network error: failed to connect to /v1/models within timeout"
+          STATUS_FILE=$(mktemp)
+          trap 'rm -f "$STATUS_FILE"' EXIT
+
+          CURL_EXIT=0
+          curl -s -S \
+            --connect-timeout 5 \
+            --max-time 10 \
+            -o /dev/null \
+            -w "%{http_code}" \
+            "${TARGET_URL}/v1/models" > "$STATUS_FILE" || CURL_EXIT=$?
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "::error::Transport error: curl failed with exit code $CURL_EXIT on unauthenticated /v1/models"
             exit 1
           fi
+
+          HTTP_CODE=$(cat "$STATUS_FILE")
           if [ "$HTTP_CODE" != "401" ]; then
             echo "::error::Security check failed: expected HTTP 401 Unauthorized for unauthenticated request, received HTTP $HTTP_CODE"
             exit 1
           fi
+
           echo "Check C passed: received expected HTTP 401 Unauthorized"
 
       - name: "Check D — Authenticated Unsupported Route (GET /v1/models)"
@@ -148,13 +218,27 @@ jobs:
             exit 0
           fi
 
-          HTTP_CODE=$(curl -s -S -o /dev/null -w "%{http_code}" --max-time 10 -H "Authorization: Bearer ${PROXY_KEY}" "${TARGET_URL}/v1/models" || echo "curl_failed")
-          if [ "$HTTP_CODE" = "curl_failed" ]; then
-            echo "::error::Network error: failed to connect to /v1/models within timeout"
+          STATUS_FILE=$(mktemp)
+          trap 'rm -f "$STATUS_FILE"' EXIT
+
+          CURL_EXIT=0
+          curl -s -S \
+            --connect-timeout 5 \
+            --max-time 10 \
+            -o /dev/null \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer ${PROXY_KEY}" \
+            "${TARGET_URL}/v1/models" > "$STATUS_FILE" || CURL_EXIT=$?
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "::error::Transport error: curl failed with exit code $CURL_EXIT on authenticated /v1/models"
             exit 1
           fi
+
+          HTTP_CODE=$(cat "$STATUS_FILE")
           if [ "$HTTP_CODE" != "404" ]; then
             echo "::error::Unsupported route check failed: expected HTTP 404 Not Found, received HTTP $HTTP_CODE"
             exit 1
           fi
+
           echo "Check D passed: received expected HTTP 404 Not Found"
