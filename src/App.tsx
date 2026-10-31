@@ -227,7 +227,7 @@ export default function App() {
           <div className="flex items-center gap-2 text-xs">
             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-950/60 border border-emerald-500/30 text-emerald-400">
               <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span>171 / 171 Tests Passing</span>
+              <span>194 / 194 Tests Passing</span>
             </div>
             <div className="hidden sm:flex items-center gap-1 px-2.5 py-1 rounded-full bg-slate-800/80 border border-slate-700/60 text-slate-300 font-mono">
               <Server className="w-3.5 h-3.5 text-slate-400" />
@@ -796,7 +796,7 @@ npm run deploy`}
                     id: "AUDIT-10 (#14)",
                     title: "Final release verification & test suite",
                     status: "PASS",
-                    notes: "171/171 tests passing across unit and Miniflare workerd runtime suites.",
+                    notes: "194/194 tests passing across unit, Miniflare runtime, and smoke-validator suites.",
                   },
                 ].map(item => (
                   <div key={item.id} className="p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">

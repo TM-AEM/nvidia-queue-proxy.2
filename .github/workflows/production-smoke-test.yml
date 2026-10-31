@@ -9,7 +9,8 @@ on:
     branches:
       - main
 
-permissions: {}
+permissions:
+  contents: read
 
 concurrency:
   group: production-smoke-test
@@ -26,77 +27,30 @@ jobs:
        github.event.workflow_run.head_branch == 'main' &&
        github.event.workflow_run.conclusion == 'success')
     steps:
+      - name: Check out validation script
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/validate-worker-url.js
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Validate WORKER_URL secret
         id: validate_url
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
         run: |
-          if [ -z "$WORKER_URL" ]; then
-            echo "::error::Missing required secret WORKER_URL"
-            echo "Please set the WORKER_URL repository secret under Settings -> Secrets and variables -> Actions."
-            exit 1
-          fi
-
-          CLEAN_URL=$(node -e '
-            const raw = process.env.WORKER_URL || "";
-            if (!raw || typeof raw !== "string") {
-              console.error("::error::Missing required secret WORKER_URL");
-              process.exit(1);
-            }
-            let u;
-            try {
-              u = new URL(raw);
-            } catch {
-              console.error("::error::WORKER_URL is malformed");
-              process.exit(1);
-            }
-            if (u.protocol !== "https:") {
-              console.error("::error::WORKER_URL must use https protocol");
-              process.exit(1);
-            }
-            if (u.hostname !== "nvidia-queue-proxy-2.5s5k7kk.workers.dev") {
-              console.error("::error::WORKER_URL hostname is not authorized");
-              process.exit(1);
-            }
-            // Check for explicit ports (including default 443)
-            const hostPart = raw.replace(/^https:\/\//, "").split("/")[0].split("?")[0].split("#")[0];
-            if (hostPart.includes(":") || u.port !== "") {
-              console.error("::error::WORKER_URL must not specify an explicit port");
-              process.exit(1);
-            }
-            if (u.username !== "" || u.password !== "") {
-              console.error("::error::WORKER_URL must not contain credentials");
-              process.exit(1);
-            }
-            if (u.pathname !== "" && u.pathname !== "/") {
-              console.error("::error::WORKER_URL must not contain a path component");
-              process.exit(1);
-            }
-            if (u.search !== "") {
-              console.error("::error::WORKER_URL must not contain a query string");
-              process.exit(1);
-            }
-            if (u.hash !== "") {
-              console.error("::error::WORKER_URL must not contain a fragment");
-              process.exit(1);
-            }
-            console.log(u.origin);
-          ')
-
-          if [ -z "$CLEAN_URL" ]; then
-            exit 1
-          fi
-
-          echo "target_url=${CLEAN_URL}" >> "$GITHUB_OUTPUT"
+          node scripts/validate-worker-url.js
           echo "WORKER_URL validated successfully: authorized https workers.dev domain."
 
       - name: "Check A — Health Probe (GET /health)"
         env:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
-          BODY_FILE=$(mktemp)
-          STATUS_FILE=$(mktemp)
-          trap 'rm -f "$BODY_FILE" "$STATUS_FILE"' EXIT
+          TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          BODY_FILE="${TMP_DIR}/body.json"
+          STATUS_FILE="${TMP_DIR}/status.txt"
 
           CURL_EXIT=0
           curl -s -S \
@@ -136,9 +90,11 @@ jobs:
         env:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
-          BODY_FILE=$(mktemp)
-          STATUS_FILE=$(mktemp)
-          trap 'rm -f "$BODY_FILE" "$STATUS_FILE"' EXIT
+          TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          BODY_FILE="${TMP_DIR}/body.json"
+          STATUS_FILE="${TMP_DIR}/status.txt"
 
           CURL_EXIT=0
           curl -s -S \
@@ -184,8 +140,10 @@ jobs:
         env:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
-          STATUS_FILE=$(mktemp)
-          trap 'rm -f "$STATUS_FILE"' EXIT
+          TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          STATUS_FILE="${TMP_DIR}/status.txt"
 
           CURL_EXIT=0
           curl -s -S \
@@ -218,8 +176,10 @@ jobs:
             exit 0
           fi
 
-          STATUS_FILE=$(mktemp)
-          trap 'rm -f "$STATUS_FILE"' EXIT
+          TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          STATUS_FILE="${TMP_DIR}/status.txt"
 
           CURL_EXIT=0
           curl -s -S \
