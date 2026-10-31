@@ -341,6 +341,39 @@ The original `Retry-After` value is preserved on the downstream `429` response
 exactly once on every terminal path, and cancellation/timeout cannot trigger a
 retry after the request has finished.
 
+## Request header policy
+
+### Upstream request header sanitization
+
+Before a request is forwarded to NVIDIA, the inbound client header set is
+filtered with a **denylist** so content-negotiation and vendor payload headers
+keep working. The following are removed:
+
+- the HTTP/1.1 hop-by-hop set (RFC 9110 §7.6.1): `Connection`, `Keep-Alive`,
+  `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`,
+  `Transfer-Encoding`, `Upgrade`;
+- every header **named by the client `Connection` header**;
+- caller credentials and session state: the client `Authorization`,
+  `Proxy-Authorization`, `Cookie`/`Cookie2`, `Set-Cookie`/`Set-Cookie2`, and the
+  proxy secret `X-Proxy-Key`;
+- forwarding/topology headers so the caller's IP and internal hosts are not
+  disclosed upstream: `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`,
+  `X-Forwarded-Proto`, `X-Forwarded-Port`, `X-Real-IP`, `Via`, `True-Client-IP`,
+  `CDN-Loop`;
+- edge/platform headers injected by the runtime that reveal the caller's IP,
+  country, or edge POP: the `cf-*` family (`CF-Connecting-IP`, `CF-IPCountry`,
+  …);
+- the reserved distributed-tracing/platform-internal families listed under the
+  response policy (`x-amz-`, `x-b3-`, `grpc-`, `traceparent`, …);
+- `Host` and `Content-Length`, which the runtime recomputes for the upstream
+  request.
+
+The outbound `Authorization` header is then **set from the `NVIDIA_API_KEY`
+Worker secret**, overwriting any client-supplied value; a client can never
+inject or override the upstream credential. Documented content negotiation
+(`Content-Type`, `Accept`) and neutral vendor headers (`openai-*`,
+`x-request-id`, …) are preserved.
+
 ## Response header policy
 
 ### Upstream response header sanitization
@@ -506,11 +539,14 @@ appears in shell history. Do not add the literal key to a `curl -H` argument.
 
 There is also a tracked manual harness at `src/queue-test.html`: a standalone
 browser page (Arabic UI) that fires three concurrent `POST /v1/chat/completions`
-requests to test queueing. It hardcodes a specific `workers.dev` host and a
-sample model, and it does not test `/health` or `/ready`. It is a convenience
+requests to test queueing. The endpoint URL, `PROXY_KEY`, and model are entered
+at runtime, so no `workers.dev` host or credential is embedded in the page, and
+the page reports only status codes and timings. It issues **real, billable**
+inference requests and does not test `/health` or `/ready`. It is a convenience
 tool, not part of the deployed Worker (`wrangler.jsonc` deploys only
-`src/index.js`) and not part of `npm test`; treat it as a development aid and do
-not rely on its embedded host for operations.
+`src/index.js`) and not part of `npm test`; treat it as a development aid and
+run it only against a local Worker or an explicitly authorized test
+environment.
 
 ## Cancellation limitations
 
@@ -643,12 +679,21 @@ Complete these in order for an authorized release:
 The repository ships a GitHub Actions workflow
 (`.github/workflows/deploy.yml`) that both tests and deploys the Worker:
 
-- **Triggers.** A push to `main` that touches `src/**`, `test/**`, `wrangler.jsonc`, `package.json`, or the
+- **Triggers.** A push to `main` that touches `src/**`, `test/**`, `scripts/**`, `wrangler.jsonc`, `package.json`, or the
   workflow file itself, plus manual `workflow_dispatch`. It does **not** deploy
   on pull requests or on pushes to other branches.
+- **Main-only guard.** Because `workflow_dispatch` can be started from any
+  branch, the deploy job is gated with `if: github.ref == 'refs/heads/main'`
+  and a defense-in-depth step asserts the ref before checkout; the checkout is
+  also pinned to `ref: main`. A manual run from a non-`main` branch therefore
+  never deploys that branch's source to the production Worker.
 - **Install.** Dependencies are installed reproducibly with `npm ci`.
-- **Checks.** `npm test` and `npm run deploy:dry-run` run before deploy.
+- **Checks.** `npm run check:canonical` (a guard that fails if a second
+  Wrangler config or Worker entry point is present, or if the canonical
+  `wrangler.jsonc` `main` does not resolve to `src/index.js`), `npm run lint`,
+  `npm test`, and `npm run deploy:dry-run` all run before deploy.
 - **Deploy.** On a qualifying push to `main`, and only if the checks pass, the
   workflow runs `npm run deploy` using the `CLOUDFLARE_API_TOKEN` and
-  `CLOUDFLARE_ACCOUNT_ID` repository secrets.
+  `CLOUDFLARE_ACCOUNT_ID` repository secrets, then records the deployed commit
+  SHA and workflow run URL.
 - **Smoke test.** An automated post-deploy smoke test verifies `/health` and `/ready` against the deployed endpoint.

@@ -26,6 +26,7 @@ const {
   computeBackoffDelay,
   applyBackoffJitter,
   safeResponseHeaders,
+  safeUpstreamRequestHeaders,
   readConfigValue,
   resolveConfig,
   ConfigError,
@@ -7011,3 +7012,238 @@ test("REM-02: worker preserves 500 when PROXY_KEY or NVIDIA_API_KEY is missing f
   assert.equal(resMissingNvidia.status, 500, "missing NVIDIA_API_KEY in env must return 500");
   assert.equal(await resMissingNvidia.text(), "Server configuration error");
 });
+
+// ==========================================
+// AUDIT-07 (request side) — outbound request-header policy
+// ==========================================
+
+test("AUDIT-07: safeUpstreamRequestHeaders strips hop-by-hop, credentials, cookies, and topology headers", () => {
+  const inbound = new Headers({
+    authorization: "Bearer client-supplied-key",
+    "x-proxy-key": "client-proxy-secret",
+    cookie: "session=secret",
+    "set-cookie": "sid=leak",
+    "proxy-authorization": "Basic cHJveHk=",
+    connection: "keep-alive, x-nominated",
+    "x-nominated": "nominated-value",
+    "keep-alive": "timeout=5",
+    "transfer-encoding": "chunked",
+    te: "trailers",
+    upgrade: "websocket",
+    forwarded: "for=192.0.2.1",
+    "x-forwarded-for": "192.0.2.1",
+    "x-real-ip": "192.0.2.1",
+    via: "1.1 internal-proxy",
+    "cf-connecting-ip": "192.0.2.1",
+    "cf-ipcountry": "US",
+    "true-client-ip": "192.0.2.1",
+    "x-amz-trace": "amz-internal",
+    "x-b3-traceid": "b3-internal",
+    "content-type": "application/json",
+    accept: "application/json",
+    "openai-beta": "assistants=v2",
+    "x-request-id": "client-req-1",
+  });
+
+  const safe = safeUpstreamRequestHeaders(inbound, "nvidia-secret");
+
+  // Everything sensitive/hop-by-hop/topology must be gone. `authorization`
+  // is excluded here because it is replaced (not simply removed) below.
+  for (const name of [
+    "x-proxy-key",
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+    "connection",
+    "x-nominated",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "upgrade",
+    "forwarded",
+    "x-forwarded-for",
+    "x-real-ip",
+    "via",
+    "x-amz-trace",
+    "x-b3-traceid",
+    "cf-connecting-ip",
+    "cf-ipcountry",
+    "true-client-ip",
+  ]) {
+    assert.equal(safe.get(name), null, `${name} must not be forwarded upstream`);
+  }
+
+  // The NVIDIA credential is set from the Worker secret, not the client.
+  assert.equal(
+    safe.get("authorization"),
+    "Bearer nvidia-secret",
+    "upstream Authorization must come from the Worker secret"
+  );
+
+  // Documented content-negotiation / vendor headers must survive.
+  assert.equal(safe.get("content-type"), "application/json");
+  assert.equal(safe.get("accept"), "application/json");
+  assert.equal(safe.get("openai-beta"), "assistants=v2");
+  assert.equal(safe.get("x-request-id"), "client-req-1");
+});
+
+test("AUDIT-07: the proxied upstream request never carries the client credential or cookies", async () => {
+  const { ctx, env } = makeAggregateEnv();
+  let seenHeaders = null;
+  env.__fetch = async (_url, opts) => {
+    seenHeaders = new Headers(opts.headers);
+    return new Response("ok", { status: 200 });
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer client-supplied-key",
+      "x-proxy-key": "client-proxy-secret",
+      cookie: "session=secret",
+      connection: "x-hop",
+      "x-hop": "hop-value",
+      "content-type": "application/json",
+      "x-request-id": "keep-me",
+    },
+    body: "{}",
+  });
+
+  const res = await rateGate.fetch(req);
+  assert.equal(res.status, 200);
+
+  assert.equal(seenHeaders.get("x-proxy-key"), null, "proxy secret must not reach upstream");
+  assert.equal(seenHeaders.get("cookie"), null, "cookies must not reach upstream");
+  assert.equal(seenHeaders.get("x-hop"), null, "Connection-nominated header must not reach upstream");
+  assert.equal(
+    seenHeaders.get("authorization"),
+    "Bearer test-key",
+    "upstream Authorization is the Worker's NVIDIA key"
+  );
+  assert.equal(seenHeaders.get("content-type"), "application/json", "content negotiation preserved");
+  assert.equal(seenHeaders.get("x-request-id"), "keep-me", "safe vendor header preserved");
+});
+
+test("AUDIT-07: a replaced (truncated) 429 body drops stale representation metadata", async () => {
+  const { ctx, env } = make429Env();
+  const oversized = "x".repeat(MAX_429 + 1);
+  env.__fetch = async () =>
+    new Response(oversized, {
+      status: 429,
+      headers: {
+        "content-type": "text/plain",
+        "content-encoding": "gzip",
+        "content-range": "bytes 0-100/1000",
+        etag: '"abc123"',
+        "x-custom-upstream": "keep-me",
+      },
+    });
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  assert.equal(res.headers.get("content-encoding"), null, "stale content-encoding must be dropped");
+  assert.equal(res.headers.get("content-range"), null, "stale content-range must be dropped");
+  assert.equal(res.headers.get("etag"), null, "stale etag must be dropped");
+  assert.equal(
+    res.headers.get("content-type"),
+    "application/json",
+    "the synthetic body is declared as JSON"
+  );
+  assert.equal(
+    res.headers.get("x-custom-upstream"),
+    "keep-me",
+    "safe vendor headers are still preserved"
+  );
+
+  const parsed = JSON.parse(await res.text());
+  assert.ok(parsed.error, "the synthetic error body is valid JSON");
+});
+
+// ==========================================
+// AUDIT-03 / AUDIT-04 — documented routing and CORS decisions
+// ==========================================
+
+// The client topology is server-to-server, so browser CORS is intentionally
+// not enabled and no `Access-Control-*` headers are ever emitted (even for an
+// authenticated request). This is the executable evidence for the AUDIT-03
+// "no browser access required" decision.
+test("AUDIT-03: no CORS headers are emitted, and an unauthenticated OPTIONS preflight is rejected", async () => {
+  const env = {
+    PROXY_KEY: "test-key",
+    NVIDIA_API_KEY: "test-nvidia-key",
+    RATE_GATE: { idFromName: () => "id", get: () => ({ fetch() {} }) },
+  };
+
+  const preflight = await worker.fetch(
+    new Request("https://proxy.local/v1/chat/completions", {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://evil.example",
+        "Access-Control-Request-Method": "POST",
+      },
+    }),
+    env
+  );
+
+  // Authentication precedes routing, so an unauthenticated preflight is 401.
+  assert.equal(preflight.status, 401, "unauthenticated preflight must be rejected");
+  assert.equal(
+    preflight.headers.get("access-control-allow-origin"),
+    null,
+    "no permissive CORS header may be emitted"
+  );
+
+  const authed = await worker.fetch(
+    new Request("https://proxy.local/v1/chat/completions", {
+      method: "OPTIONS",
+      headers: { Authorization: "Bearer test-key", Origin: "https://evil.example" },
+    }),
+    env
+  );
+
+  assert.equal(authed.status, 404, "authenticated non-POST is not routed");
+  assert.equal(
+    authed.headers.get("access-control-allow-origin"),
+    null,
+    "no CORS header even for an authenticated request"
+  );
+});
+
+// `GET /v1/models` is intentionally unsupported (AUDIT-04 decision): it must
+// return 404 for an authenticated caller and never reach the Durable Object.
+test("AUDIT-04: GET /v1/models is not proxied (401 unauthenticated, 404 authenticated)", async () => {
+  let rateGateTouched = false;
+  const env = {
+    PROXY_KEY: "test-key",
+    NVIDIA_API_KEY: "test-nvidia-key",
+    RATE_GATE: {
+      idFromName: () => "id",
+      get: () => ({
+        fetch() {
+          rateGateTouched = true;
+          return new Response("should not happen", { status: 200 });
+        },
+      }),
+    },
+  };
+
+  const unauth = await worker.fetch(
+    new Request("https://proxy.local/v1/models", { method: "GET" }),
+    env
+  );
+  assert.equal(unauth.status, 401, "unauthenticated /v1/models must be 401");
+
+  const authed = await worker.fetch(
+    new Request("https://proxy.local/v1/models", {
+      method: "GET",
+      headers: { Authorization: "Bearer test-key" },
+    }),
+    env
+  );
+  assert.equal(authed.status, 404, "authenticated GET /v1/models must be 404");
+  assert.equal(rateGateTouched, false, "the Durable Object must not be reached");
+});
+

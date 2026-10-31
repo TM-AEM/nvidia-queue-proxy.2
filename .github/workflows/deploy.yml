@@ -7,6 +7,7 @@ on:
     paths:
       - "src/**"
       - "test/**"
+      - "scripts/**"
       - "wrangler.jsonc"
       - "package.json"
       - "package-lock.json"
@@ -22,10 +23,26 @@ concurrency:
 
 jobs:
   test-and-deploy:
+    # Production deployment is restricted to the canonical `main` ref. A
+    # `workflow_dispatch` run can be started from any branch, so this guard
+    # prevents a manually dispatched run on a non-main branch from deploying
+    # that branch's source to the production Worker.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
+      - name: Assert canonical main ref
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Refusing to deploy from ${{ github.ref }}; production deploy is restricted to refs/heads/main."
+            exit 1
+          fi
+
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -35,6 +52,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Canonical deployment guard
+        run: npm run check:canonical
 
       - name: TypeScript typecheck
         run: npm run lint
@@ -65,3 +85,10 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npm run deploy
+
+      - name: Record deployed commit
+        if: always()
+        run: |
+          echo "Triggering ref: ${{ github.ref }}"
+          echo "Deployed commit SHA (checked out): $(git rev-parse HEAD)"
+          echo "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
