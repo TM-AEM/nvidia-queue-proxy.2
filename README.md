@@ -682,6 +682,11 @@ The repository ships a GitHub Actions workflow
 - **Triggers.** A push to `main` that touches `src/**`, `test/**`, `scripts/**`, `wrangler.jsonc`, `package.json`, or the
   workflow file itself, plus manual `workflow_dispatch`. It does **not** deploy
   on pull requests or on pushes to other branches.
+- **Main-only guard.** Because `workflow_dispatch` can be started from any
+  branch, the deploy job is gated with `if: github.ref == 'refs/heads/main'`
+  and a defense-in-depth step asserts the ref before checkout; the checkout is
+  also pinned to `ref: main`. A manual run from a non-`main` branch therefore
+  never deploys that branch's source to the production Worker.
 - **Install.** Dependencies are installed reproducibly with `npm ci`.
 - **Checks.** `npm run check:canonical` (a guard that fails if a second
   Wrangler config or Worker entry point is present, or if the canonical
