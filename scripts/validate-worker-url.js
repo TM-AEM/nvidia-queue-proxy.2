@@ -34,32 +34,36 @@ export function validateWorkerUrl(raw, expectedHostname = AUTHORIZED_WORKER_HOST
     return { valid: false, error: "WORKER_URL must use https protocol" };
   }
 
-  // 2. Enforce exact authorized hostname
-  if (parsed.hostname !== expectedHostname) {
-    return { valid: false, error: "WORKER_URL hostname is not authorized" };
+  // Extract authority component (between "://" and first "/", "?", or "#")
+  const schemeEnd = raw.indexOf("://");
+  if (schemeEnd === -1) {
+    return { valid: false, error: "WORKER_URL is malformed" };
   }
+  const authority = raw.slice(schemeEnd + 3).split("/")[0].split("?")[0].split("#")[0];
 
-  // 3. Reject any explicit port (including default :443)
-  // WHATWG URL normalizes :443 on https, so check the authority segment in raw input as well
-  const authority = raw.slice(raw.indexOf("://") + 3).split("/")[0].split("?")[0].split("#")[0];
-  if (authority.includes(":") || parsed.port !== "") {
-    return { valid: false, error: "WORKER_URL must not specify an explicit port" };
-  }
-
-  // 4. Reject credentials (username / password)
+  // 2. Detect credentials BEFORE checking authority colon
   if (parsed.username !== "" || parsed.password !== "" || authority.includes("@")) {
     return { valid: false, error: "WORKER_URL must not contain credentials" };
   }
 
-  // 5. Reject unexpected paths (allow only empty or single trailing slash)
-  if (parsed.pathname !== "" && parsed.pathname !== "/") {
-    return { valid: false, error: "WORKER_URL must not contain a path component" };
+  // 3. Reject any explicit port (including default :443 and non-standard :8080)
+  if (authority.includes(":") || parsed.port !== "") {
+    return { valid: false, error: "WORKER_URL must not specify an explicit port" };
   }
 
-  // Reject multiple trailing slashes (e.g. https://domain//)
-  const afterAuthority = raw.slice(raw.indexOf(authority) + authority.length);
+  // 4. Enforce exact authorized hostname
+  if (parsed.hostname !== expectedHostname) {
+    return { valid: false, error: "WORKER_URL hostname is not authorized" };
+  }
+
+  // 5. Reject multiple trailing slashes or unexpected paths
+  const afterAuthority = raw.slice(schemeEnd + 3 + authority.length);
   if (afterAuthority.startsWith("//")) {
     return { valid: false, error: "WORKER_URL contains multiple trailing slashes" };
+  }
+
+  if (parsed.pathname !== "" && parsed.pathname !== "/") {
+    return { valid: false, error: "WORKER_URL must not contain a path component" };
   }
 
   // 6. Reject query strings

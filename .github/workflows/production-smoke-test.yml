@@ -27,10 +27,10 @@ jobs:
        github.event.workflow_run.head_branch == 'main' &&
        github.event.workflow_run.conclusion == 'success')
     steps:
-      - name: Check out validation script
+      - name: Check out validation scripts
         uses: actions/checkout@v4
         with:
-          sparse-checkout: scripts/validate-worker-url.js
+          sparse-checkout: scripts
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -47,7 +47,7 @@ jobs:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
           TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
-          trap 'rm -rf "$TMP_DIR"' EXIT
+          trap 'rm -rf "${TMP_DIR:-}"' EXIT
 
           BODY_FILE="${TMP_DIR}/body.json"
           STATUS_FILE="${TMP_DIR}/status.txt"
@@ -66,24 +66,7 @@ jobs:
           fi
 
           HTTP_CODE=$(cat "$STATUS_FILE")
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::Health probe failed: expected HTTP 200, received HTTP $HTTP_CODE"
-            exit 1
-          fi
-
-          node -e '
-            const fs = require("fs");
-            try {
-              const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-              if (data.ok === true) process.exit(0);
-              console.error("::error::Health check failed: expected payload {ok: true}");
-              process.exit(1);
-            } catch {
-              console.error("::error::Health check failed: response was not valid JSON");
-              process.exit(1);
-            }
-          ' "$BODY_FILE"
-
+          node scripts/smoke-http-validate.js health "$HTTP_CODE" "$BODY_FILE"
           echo "Check A passed: HTTP 200, valid payload with ok=true"
 
       - name: "Check B — Readiness Probe (GET /ready)"
@@ -91,7 +74,7 @@ jobs:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
           TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
-          trap 'rm -rf "$TMP_DIR"' EXIT
+          trap 'rm -rf "${TMP_DIR:-}"' EXIT
 
           BODY_FILE="${TMP_DIR}/body.json"
           STATUS_FILE="${TMP_DIR}/status.txt"
@@ -110,30 +93,7 @@ jobs:
           fi
 
           HTTP_CODE=$(cat "$STATUS_FILE")
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::Readiness probe failed: expected HTTP 200, received HTTP $HTTP_CODE"
-            exit 1
-          fi
-
-          node -e '
-            const fs = require("fs");
-            try {
-              const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-              const checks = data.checks || {};
-              if (data.ready === true &&
-                  checks.proxy_key === true &&
-                  checks.upstream_key === true &&
-                  checks.rate_gate === true) {
-                process.exit(0);
-              }
-              console.error("::error::Readiness check failed: one or more required bindings are not ready");
-              process.exit(1);
-            } catch {
-              console.error("::error::Readiness check failed: response was not valid JSON");
-              process.exit(1);
-            }
-          ' "$BODY_FILE"
-
+          node scripts/smoke-http-validate.js ready "$HTTP_CODE" "$BODY_FILE"
           echo "Check B passed: HTTP 200, all checks ready (proxy_key, upstream_key, rate_gate)"
 
       - name: "Check C — Unauthenticated Route Security (GET /v1/models)"
@@ -141,7 +101,7 @@ jobs:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
           TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
-          trap 'rm -rf "$TMP_DIR"' EXIT
+          trap 'rm -rf "${TMP_DIR:-}"' EXIT
 
           STATUS_FILE="${TMP_DIR}/status.txt"
 
@@ -159,11 +119,7 @@ jobs:
           fi
 
           HTTP_CODE=$(cat "$STATUS_FILE")
-          if [ "$HTTP_CODE" != "401" ]; then
-            echo "::error::Security check failed: expected HTTP 401 Unauthorized for unauthenticated request, received HTTP $HTTP_CODE"
-            exit 1
-          fi
-
+          node scripts/smoke-http-validate.js unauth-models "$HTTP_CODE"
           echo "Check C passed: received expected HTTP 401 Unauthorized"
 
       - name: "Check D — Authenticated Unsupported Route (GET /v1/models)"
@@ -177,7 +133,7 @@ jobs:
           fi
 
           TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
-          trap 'rm -rf "$TMP_DIR"' EXIT
+          trap 'rm -rf "${TMP_DIR:-}"' EXIT
 
           STATUS_FILE="${TMP_DIR}/status.txt"
 
@@ -196,9 +152,5 @@ jobs:
           fi
 
           HTTP_CODE=$(cat "$STATUS_FILE")
-          if [ "$HTTP_CODE" != "404" ]; then
-            echo "::error::Unsupported route check failed: expected HTTP 404 Not Found, received HTTP $HTTP_CODE"
-            exit 1
-          fi
-
+          node scripts/smoke-http-validate.js auth-models "$HTTP_CODE"
           echo "Check D passed: received expected HTTP 404 Not Found"
