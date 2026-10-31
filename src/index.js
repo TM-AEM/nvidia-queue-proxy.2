@@ -841,7 +841,15 @@ const TOPOLOGY_REQUEST_HEADERS = [
   "x-forwarded-port",
   "x-real-ip",
   "via",
+  "cdn-loop",
+  "true-client-ip",
 ];
+
+// Platform/runtime headers injected by the edge (Cloudflare `cf-*`, plus any
+// `x-cloud-trace-*` handled by the infrastructure families below). They
+// disclose the caller's IP, country, edge POP, and Worker internals, and NVIDIA
+// never needs them.
+const PLATFORM_REQUEST_HEADER_PREFIXES = ["cf-"];
 
 // Body-representation metadata that describes the *original* upstream body.
 // When the proxy replaces or truncates that body (e.g. an oversized 429 body
@@ -882,6 +890,16 @@ export function safeUpstreamRequestHeaders(headers, nvidiaApiKey) {
 
   for (const name of [...result.keys()]) {
     for (const prefix of INFRASTRUCTURE_RESPONSE_HEADER_PREFIXES) {
+      if (name.startsWith(prefix)) {
+        result.delete(name);
+        break;
+      }
+    }
+  }
+
+  // Strip edge/platform headers (e.g. `cf-connecting-ip`, `cf-ipcountry`).
+  for (const name of [...result.keys()]) {
+    for (const prefix of PLATFORM_REQUEST_HEADER_PREFIXES) {
       if (name.startsWith(prefix)) {
         result.delete(name);
         break;

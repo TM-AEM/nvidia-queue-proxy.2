@@ -358,7 +358,11 @@ keep working. The following are removed:
   proxy secret `X-Proxy-Key`;
 - forwarding/topology headers so the caller's IP and internal hosts are not
   disclosed upstream: `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`,
-  `X-Forwarded-Proto`, `X-Forwarded-Port`, `X-Real-IP`, `Via`;
+  `X-Forwarded-Proto`, `X-Forwarded-Port`, `X-Real-IP`, `Via`, `True-Client-IP`,
+  `CDN-Loop`;
+- edge/platform headers injected by the runtime that reveal the caller's IP,
+  country, or edge POP: the `cf-*` family (`CF-Connecting-IP`, `CF-IPCountry`,
+  …);
 - the reserved distributed-tracing/platform-internal families listed under the
   response policy (`x-amz-`, `x-b3-`, `grpc-`, `traceparent`, …);
 - `Host` and `Content-Length`, which the runtime recomputes for the upstream

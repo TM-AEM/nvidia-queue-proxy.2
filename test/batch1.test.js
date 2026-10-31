@@ -7034,6 +7034,9 @@ test("AUDIT-07: safeUpstreamRequestHeaders strips hop-by-hop, credentials, cooki
     "x-forwarded-for": "192.0.2.1",
     "x-real-ip": "192.0.2.1",
     via: "1.1 internal-proxy",
+    "cf-connecting-ip": "192.0.2.1",
+    "cf-ipcountry": "US",
+    "true-client-ip": "192.0.2.1",
     "x-amz-trace": "amz-internal",
     "x-b3-traceid": "b3-internal",
     "content-type": "application/json",
@@ -7063,6 +7066,9 @@ test("AUDIT-07: safeUpstreamRequestHeaders strips hop-by-hop, credentials, cooki
     "via",
     "x-amz-trace",
     "x-b3-traceid",
+    "cf-connecting-ip",
+    "cf-ipcountry",
+    "true-client-ip",
   ]) {
     assert.equal(safe.get(name), null, `${name} must not be forwarded upstream`);
   }
