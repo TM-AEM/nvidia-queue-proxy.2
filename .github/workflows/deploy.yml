@@ -65,29 +65,3 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npm run deploy
-
-      - name: Post-deployment health & readiness smoke test
-        env:
-          WORKER_URL: ${{ secrets.WORKER_URL }}
-        run: |
-          if [ -z "$WORKER_URL" ]; then
-            echo "WORKER_URL secret not set; skipping live smoke test."
-            exit 0
-          fi
-
-          echo "Starting smoke check on $WORKER_URL..."
-          # Test /health (liveness)
-          HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$WORKER_URL/health" || echo "failed")
-          if [ "$HEALTH_STATUS" != "200" ]; then
-            echo "::error::Liveness probe /health failed with HTTP $HEALTH_STATUS"
-            exit 1
-          fi
-          echo "Liveness check /health passed (HTTP 200)."
-
-          # Test /ready (readiness)
-          READY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$WORKER_URL/ready" || echo "failed")
-          if [ "$READY_STATUS" != "200" ]; then
-            echo "::error::Readiness probe /ready failed with HTTP $READY_STATUS"
-            exit 1
-          fi
-          echo "Readiness check /ready passed (HTTP 200)."

@@ -9,8 +9,7 @@ on:
     branches:
       - main
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: production-smoke-test
@@ -21,9 +20,14 @@ jobs:
     name: Execute Production Smoke Tests
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') }}
+    if: |
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.conclusion == 'success')
     steps:
       - name: Validate WORKER_URL secret
+        id: validate_url
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
         run: |
@@ -32,88 +36,125 @@ jobs:
             echo "Please set the WORKER_URL repository secret under Settings -> Secrets and variables -> Actions."
             exit 1
           fi
-          echo "WORKER_URL secret detected."
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
+          CLEAN_URL=$(node -e '
+            const raw = process.env.WORKER_URL || "";
+            let u;
+            try {
+              u = new URL(raw);
+            } catch {
+              console.error("::error::WORKER_URL is malformed");
+              process.exit(1);
+            }
+            if (u.protocol !== "https:") {
+              console.error("::error::WORKER_URL must use https protocol");
+              process.exit(1);
+            }
+            if (!/^[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.workers\.dev$/.test(u.hostname)) {
+              console.error("::error::WORKER_URL hostname is not an authorized workers.dev domain");
+              process.exit(1);
+            }
+            console.log(u.origin);
+          ')
+
+          echo "target_url=${CLEAN_URL}" >> "$GITHUB_OUTPUT"
+          echo "WORKER_URL validated successfully: authorized https workers.dev domain."
 
       - name: "Check A — Health Probe (GET /health)"
         env:
-          WORKER_URL: ${{ secrets.WORKER_URL }}
+          TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
-          HEALTH_JSON=$(curl -s -f --max-time 10 "${WORKER_URL}/health")
-          echo "$HEALTH_JSON" | node -e '
-            let input = "";
-            process.stdin.on("data", c => input += c);
-            process.stdin.on("end", () => {
-              try {
-                const d = JSON.parse(input);
-                if (d.ok === true) process.exit(0);
-                console.error("Invalid health payload:", input);
-                process.exit(1);
-              } catch (e) {
-                console.error("Malformed JSON:", e.message);
-                process.exit(1);
-              }
-            });
+          HTTP_CODE=$(curl -s -S -o /tmp/health_body.json -w "%{http_code}" --max-time 10 "${TARGET_URL}/health" || echo "curl_failed")
+          if [ "$HTTP_CODE" = "curl_failed" ]; then
+            echo "::error::Network error: failed to connect to /health within timeout"
+            exit 1
+          fi
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Health probe failed: expected HTTP 200, received HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          node -e '
+            const fs = require("fs");
+            try {
+              const body = fs.readFileSync("/tmp/health_body.json", "utf8");
+              const data = JSON.parse(body);
+              if (data.ok === true) process.exit(0);
+              console.error("::error::Health check failed: expected payload {ok: true}");
+              process.exit(1);
+            } catch (err) {
+              console.error("::error::Health check failed: response was not valid JSON");
+              process.exit(1);
+            }
           '
-          echo "Check A passed: HTTP 200, ok=true"
+          echo "Check A passed: HTTP 200, valid JSON payload with ok=true"
 
       - name: "Check B — Readiness Probe (GET /ready)"
         env:
-          WORKER_URL: ${{ secrets.WORKER_URL }}
+          TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
-          READY_JSON=$(curl -s -f --max-time 10 "${WORKER_URL}/ready")
-          echo "$READY_JSON" | node -e '
-            let input = "";
-            process.stdin.on("data", c => input += c);
-            process.stdin.on("end", () => {
-              try {
-                const d = JSON.parse(input);
-                const checks = d.checks || {};
-                const valid = d.ready === true &&
-                              checks.proxy_key === true &&
-                              checks.upstream_key === true &&
-                              checks.rate_gate === true;
-                if (valid) process.exit(0);
-                console.error("Readiness check failure:", input);
-                process.exit(1);
-              } catch (e) {
-                console.error("Malformed JSON:", e.message);
-                process.exit(1);
-              }
-            });
+          HTTP_CODE=$(curl -s -S -o /tmp/ready_body.json -w "%{http_code}" --max-time 10 "${TARGET_URL}/ready" || echo "curl_failed")
+          if [ "$HTTP_CODE" = "curl_failed" ]; then
+            echo "::error::Network error: failed to connect to /ready within timeout"
+            exit 1
+          fi
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Readiness probe failed: expected HTTP 200, received HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          node -e '
+            const fs = require("fs");
+            try {
+              const body = fs.readFileSync("/tmp/ready_body.json", "utf8");
+              const data = JSON.parse(body);
+              const checks = data.checks || {};
+              const valid = data.ready === true &&
+                            checks.proxy_key === true &&
+                            checks.upstream_key === true &&
+                            checks.rate_gate === true;
+              if (valid) process.exit(0);
+              console.error("::error::Readiness check failed: one or more required bindings are not ready");
+              process.exit(1);
+            } catch (err) {
+              console.error("::error::Readiness check failed: response was not valid JSON");
+              process.exit(1);
+            }
           '
-          echo "Check B passed: HTTP 200, all checks ready"
+          echo "Check B passed: HTTP 200, all checks ready (proxy_key, upstream_key, rate_gate)"
 
       - name: "Check C — Unauthenticated Route Security (GET /v1/models)"
         env:
-          WORKER_URL: ${{ secrets.WORKER_URL }}
+          TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
-          STATUS_C=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${WORKER_URL}/v1/models")
-          if [ "$STATUS_C" = "401" ]; then
-            echo "Check C passed: got expected HTTP 401 Unauthorized"
-          else
-            echo "::error::Check C failed: expected HTTP 401, got $STATUS_C"
+          HTTP_CODE=$(curl -s -S -o /dev/null -w "%{http_code}" --max-time 10 "${TARGET_URL}/v1/models" || echo "curl_failed")
+          if [ "$HTTP_CODE" = "curl_failed" ]; then
+            echo "::error::Network error: failed to connect to /v1/models within timeout"
             exit 1
           fi
+          if [ "$HTTP_CODE" != "401" ]; then
+            echo "::error::Security check failed: expected HTTP 401 Unauthorized for unauthenticated request, received HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "Check C passed: received expected HTTP 401 Unauthorized"
 
       - name: "Check D — Authenticated Unsupported Route (GET /v1/models)"
         env:
-          WORKER_URL: ${{ secrets.WORKER_URL }}
+          TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
           PROXY_KEY: ${{ secrets.PROXY_KEY }}
         run: |
           if [ -z "$PROXY_KEY" ]; then
-            echo "Optional PROXY_KEY secret not configured in repository; skipping Check D."
+            echo "Optional PROXY_KEY secret not set; skipping Check D."
             exit 0
           fi
 
-          STATUS_D=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 -H "Authorization: Bearer ${PROXY_KEY}" "${WORKER_URL}/v1/models")
-          if [ "$STATUS_D" = "404" ]; then
-            echo "Check D passed: got expected HTTP 404 Not Found"
-          else
-            echo "::error::Check D failed: expected HTTP 404, got $STATUS_D"
+          HTTP_CODE=$(curl -s -S -o /dev/null -w "%{http_code}" --max-time 10 -H "Authorization: Bearer ${PROXY_KEY}" "${TARGET_URL}/v1/models" || echo "curl_failed")
+          if [ "$HTTP_CODE" = "curl_failed" ]; then
+            echo "::error::Network error: failed to connect to /v1/models within timeout"
             exit 1
           fi
+          if [ "$HTTP_CODE" != "404" ]; then
+            echo "::error::Unsupported route check failed: expected HTTP 404 Not Found, received HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "Check D passed: received expected HTTP 404 Not Found"
