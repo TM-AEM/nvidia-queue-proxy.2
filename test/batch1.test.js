@@ -7157,7 +7157,93 @@ test("AUDIT-07: a replaced (truncated) 429 body drops stale representation metad
     "keep-me",
     "safe vendor headers are still preserved"
   );
+
   const parsed = JSON.parse(await res.text());
   assert.ok(parsed.error, "the synthetic error body is valid JSON");
+});
+
+// ==========================================
+// AUDIT-03 / AUDIT-04 — documented routing and CORS decisions
+// ==========================================
+
+// The client topology is server-to-server, so browser CORS is intentionally
+// not enabled and no `Access-Control-*` headers are ever emitted (even for an
+// authenticated request). This is the executable evidence for the AUDIT-03
+// "no browser access required" decision.
+test("AUDIT-03: no CORS headers are emitted, and an unauthenticated OPTIONS preflight is rejected", async () => {
+  const env = {
+    PROXY_KEY: "test-key",
+    NVIDIA_API_KEY: "test-nvidia-key",
+    RATE_GATE: { idFromName: () => "id", get: () => ({ fetch() {} }) },
+  };
+
+  const preflight = await worker.fetch(
+    new Request("https://proxy.local/v1/chat/completions", {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://evil.example",
+        "Access-Control-Request-Method": "POST",
+      },
+    }),
+    env
+  );
+
+  // Authentication precedes routing, so an unauthenticated preflight is 401.
+  assert.equal(preflight.status, 401, "unauthenticated preflight must be rejected");
+  assert.equal(
+    preflight.headers.get("access-control-allow-origin"),
+    null,
+    "no permissive CORS header may be emitted"
+  );
+
+  const authed = await worker.fetch(
+    new Request("https://proxy.local/v1/chat/completions", {
+      method: "OPTIONS",
+      headers: { Authorization: "Bearer test-key", Origin: "https://evil.example" },
+    }),
+    env
+  );
+
+  assert.equal(authed.status, 404, "authenticated non-POST is not routed");
+  assert.equal(
+    authed.headers.get("access-control-allow-origin"),
+    null,
+    "no CORS header even for an authenticated request"
+  );
+});
+
+// `GET /v1/models` is intentionally unsupported (AUDIT-04 decision): it must
+// return 404 for an authenticated caller and never reach the Durable Object.
+test("AUDIT-04: GET /v1/models is not proxied (401 unauthenticated, 404 authenticated)", async () => {
+  let rateGateTouched = false;
+  const env = {
+    PROXY_KEY: "test-key",
+    NVIDIA_API_KEY: "test-nvidia-key",
+    RATE_GATE: {
+      idFromName: () => "id",
+      get: () => ({
+        fetch() {
+          rateGateTouched = true;
+          return new Response("should not happen", { status: 200 });
+        },
+      }),
+    },
+  };
+
+  const unauth = await worker.fetch(
+    new Request("https://proxy.local/v1/models", { method: "GET" }),
+    env
+  );
+  assert.equal(unauth.status, 401, "unauthenticated /v1/models must be 401");
+
+  const authed = await worker.fetch(
+    new Request("https://proxy.local/v1/models", {
+      method: "GET",
+      headers: { Authorization: "Bearer test-key" },
+    }),
+    env
+  );
+  assert.equal(authed.status, 404, "authenticated GET /v1/models must be 404");
+  assert.equal(rateGateTouched, false, "the Durable Object must not be reached");
 });
 
