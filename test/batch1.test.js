@@ -26,6 +26,7 @@ const {
   computeBackoffDelay,
   applyBackoffJitter,
   safeResponseHeaders,
+  safeUpstreamRequestHeaders,
   readConfigValue,
   resolveConfig,
   ConfigError,
@@ -7011,3 +7012,146 @@ test("REM-02: worker preserves 500 when PROXY_KEY or NVIDIA_API_KEY is missing f
   assert.equal(resMissingNvidia.status, 500, "missing NVIDIA_API_KEY in env must return 500");
   assert.equal(await resMissingNvidia.text(), "Server configuration error");
 });
+
+// ==========================================
+// AUDIT-07 (request side) — outbound request-header policy
+// ==========================================
+
+test("AUDIT-07: safeUpstreamRequestHeaders strips hop-by-hop, credentials, cookies, and topology headers", () => {
+  const inbound = new Headers({
+    authorization: "Bearer client-supplied-key",
+    "x-proxy-key": "client-proxy-secret",
+    cookie: "session=secret",
+    "set-cookie": "sid=leak",
+    "proxy-authorization": "Basic cHJveHk=",
+    connection: "keep-alive, x-nominated",
+    "x-nominated": "nominated-value",
+    "keep-alive": "timeout=5",
+    "transfer-encoding": "chunked",
+    te: "trailers",
+    upgrade: "websocket",
+    forwarded: "for=192.0.2.1",
+    "x-forwarded-for": "192.0.2.1",
+    "x-real-ip": "192.0.2.1",
+    via: "1.1 internal-proxy",
+    "x-amz-trace": "amz-internal",
+    "x-b3-traceid": "b3-internal",
+    "content-type": "application/json",
+    accept: "application/json",
+    "openai-beta": "assistants=v2",
+    "x-request-id": "client-req-1",
+  });
+
+  const safe = safeUpstreamRequestHeaders(inbound, "nvidia-secret");
+
+  // Everything sensitive/hop-by-hop/topology must be gone. `authorization`
+  // is excluded here because it is replaced (not simply removed) below.
+  for (const name of [
+    "x-proxy-key",
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+    "connection",
+    "x-nominated",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "upgrade",
+    "forwarded",
+    "x-forwarded-for",
+    "x-real-ip",
+    "via",
+    "x-amz-trace",
+    "x-b3-traceid",
+  ]) {
+    assert.equal(safe.get(name), null, `${name} must not be forwarded upstream`);
+  }
+
+  // The NVIDIA credential is set from the Worker secret, not the client.
+  assert.equal(
+    safe.get("authorization"),
+    "Bearer nvidia-secret",
+    "upstream Authorization must come from the Worker secret"
+  );
+
+  // Documented content-negotiation / vendor headers must survive.
+  assert.equal(safe.get("content-type"), "application/json");
+  assert.equal(safe.get("accept"), "application/json");
+  assert.equal(safe.get("openai-beta"), "assistants=v2");
+  assert.equal(safe.get("x-request-id"), "client-req-1");
+});
+
+test("AUDIT-07: the proxied upstream request never carries the client credential or cookies", async () => {
+  const { ctx, env } = makeAggregateEnv();
+  let seenHeaders = null;
+  env.__fetch = async (_url, opts) => {
+    seenHeaders = new Headers(opts.headers);
+    return new Response("ok", { status: 200 });
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer client-supplied-key",
+      "x-proxy-key": "client-proxy-secret",
+      cookie: "session=secret",
+      connection: "x-hop",
+      "x-hop": "hop-value",
+      "content-type": "application/json",
+      "x-request-id": "keep-me",
+    },
+    body: "{}",
+  });
+
+  const res = await rateGate.fetch(req);
+  assert.equal(res.status, 200);
+
+  assert.equal(seenHeaders.get("x-proxy-key"), null, "proxy secret must not reach upstream");
+  assert.equal(seenHeaders.get("cookie"), null, "cookies must not reach upstream");
+  assert.equal(seenHeaders.get("x-hop"), null, "Connection-nominated header must not reach upstream");
+  assert.equal(
+    seenHeaders.get("authorization"),
+    "Bearer test-key",
+    "upstream Authorization is the Worker's NVIDIA key"
+  );
+  assert.equal(seenHeaders.get("content-type"), "application/json", "content negotiation preserved");
+  assert.equal(seenHeaders.get("x-request-id"), "keep-me", "safe vendor header preserved");
+});
+
+test("AUDIT-07: a replaced (truncated) 429 body drops stale representation metadata", async () => {
+  const { ctx, env } = make429Env();
+  const oversized = "x".repeat(MAX_429 + 1);
+  env.__fetch = async () =>
+    new Response(oversized, {
+      status: 429,
+      headers: {
+        "content-type": "text/plain",
+        "content-encoding": "gzip",
+        "content-range": "bytes 0-100/1000",
+        etag: '"abc123"',
+        "x-custom-upstream": "keep-me",
+      },
+    });
+
+  const rateGate = new RateGate(ctx, env);
+  const res = await rateGate.fetch(chatRequest());
+
+  assert.equal(res.status, 429);
+  assert.equal(res.headers.get("content-encoding"), null, "stale content-encoding must be dropped");
+  assert.equal(res.headers.get("content-range"), null, "stale content-range must be dropped");
+  assert.equal(res.headers.get("etag"), null, "stale etag must be dropped");
+  assert.equal(
+    res.headers.get("content-type"),
+    "application/json",
+    "the synthetic body is declared as JSON"
+  );
+  assert.equal(
+    res.headers.get("x-custom-upstream"),
+    "keep-me",
+    "safe vendor headers are still preserved"
+  );
+  const parsed = JSON.parse(await res.text());
+  assert.ok(parsed.error, "the synthetic error body is valid JSON");
+});
+
