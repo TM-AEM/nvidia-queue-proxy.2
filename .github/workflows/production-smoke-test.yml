@@ -1,0 +1,119 @@
+name: Production Smoke Test
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Test and Deploy NVIDIA Queue Proxy"]
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-smoke-test
+  cancel-in-progress: false
+
+jobs:
+  smoke-test:
+    name: Execute Production Smoke Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') }}
+    steps:
+      - name: Validate WORKER_URL secret
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+        run: |
+          if [ -z "$WORKER_URL" ]; then
+            echo "::error::Missing required secret WORKER_URL"
+            echo "Please set the WORKER_URL repository secret under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "WORKER_URL secret detected."
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: "Check A — Health Probe (GET /health)"
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+        run: |
+          HEALTH_JSON=$(curl -s -f --max-time 10 "${WORKER_URL}/health")
+          echo "$HEALTH_JSON" | node -e '
+            let input = "";
+            process.stdin.on("data", c => input += c);
+            process.stdin.on("end", () => {
+              try {
+                const d = JSON.parse(input);
+                if (d.ok === true) process.exit(0);
+                console.error("Invalid health payload:", input);
+                process.exit(1);
+              } catch (e) {
+                console.error("Malformed JSON:", e.message);
+                process.exit(1);
+              }
+            });
+          '
+          echo "Check A passed: HTTP 200, ok=true"
+
+      - name: "Check B — Readiness Probe (GET /ready)"
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+        run: |
+          READY_JSON=$(curl -s -f --max-time 10 "${WORKER_URL}/ready")
+          echo "$READY_JSON" | node -e '
+            let input = "";
+            process.stdin.on("data", c => input += c);
+            process.stdin.on("end", () => {
+              try {
+                const d = JSON.parse(input);
+                const checks = d.checks || {};
+                const valid = d.ready === true &&
+                              checks.proxy_key === true &&
+                              checks.upstream_key === true &&
+                              checks.rate_gate === true;
+                if (valid) process.exit(0);
+                console.error("Readiness check failure:", input);
+                process.exit(1);
+              } catch (e) {
+                console.error("Malformed JSON:", e.message);
+                process.exit(1);
+              }
+            });
+          '
+          echo "Check B passed: HTTP 200, all checks ready"
+
+      - name: "Check C — Unauthenticated Route Security (GET /v1/models)"
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+        run: |
+          STATUS_C=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${WORKER_URL}/v1/models")
+          if [ "$STATUS_C" = "401" ]; then
+            echo "Check C passed: got expected HTTP 401 Unauthorized"
+          else
+            echo "::error::Check C failed: expected HTTP 401, got $STATUS_C"
+            exit 1
+          fi
+
+      - name: "Check D — Authenticated Unsupported Route (GET /v1/models)"
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          PROXY_KEY: ${{ secrets.PROXY_KEY }}
+        run: |
+          if [ -z "$PROXY_KEY" ]; then
+            echo "Optional PROXY_KEY secret not configured in repository; skipping Check D."
+            exit 0
+          fi
+
+          STATUS_D=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 -H "Authorization: Bearer ${PROXY_KEY}" "${WORKER_URL}/v1/models")
+          if [ "$STATUS_D" = "404" ]; then
+            echo "Check D passed: got expected HTTP 404 Not Found"
+          else
+            echo "::error::Check D failed: expected HTTP 404, got $STATUS_D"
+            exit 1
+          fi
