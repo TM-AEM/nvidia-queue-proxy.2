@@ -1,17 +1,11 @@
 name: Test and Deploy NVIDIA Queue Proxy
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "src/**"
-      - "test/**"
-      - "scripts/**"
-      - "wrangler.jsonc"
-      - "package.json"
-      - "package-lock.json"
-      - ".github/workflows/deploy.yml"
+  # Production deployment is MANUAL ONLY. A push — including a PR merge to
+  # `main` — must never deploy automatically, so there is deliberately no
+  # `push` trigger here. An operator starts the run from `main`; the job is
+  # additionally gated by the `production` environment (required reviewers)
+  # and the main-ref assertion below.
   workflow_dispatch:
 
 permissions:
@@ -30,6 +24,11 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Human authorization gate. The `production` environment must be
+    # configured with required reviewers so the deploy step waits for an
+    # independent approval before it can run.
+    environment:
+      name: production
     steps:
       - name: Assert canonical main ref
         run: |

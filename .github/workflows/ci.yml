@@ -1,0 +1,49 @@
+name: CI
+
+# Independent, secret-free validation. This workflow never deploys and never
+# references repository secrets, so it is safe to run against untrusted pull
+# request code from forks. Production deployment is handled exclusively by the
+# manually dispatched `deploy.yml` workflow.
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Canonical deployment guard
+        run: npm run check:canonical
+
+      - name: TypeScript typecheck
+        run: npm run lint
+
+      - name: Run unit and workerd runtime tests
+        run: npm test
+
+      - name: Validate deployment bundle (no deploy)
+        run: npm run deploy:dry-run

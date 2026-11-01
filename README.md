@@ -676,24 +676,67 @@ Complete these in order for an authorized release:
 
 ## Continuous integration and deployment
 
-The repository ships a GitHub Actions workflow
-(`.github/workflows/deploy.yml`) that both tests and deploys the Worker:
+CI and production deployment are **deliberately separated**:
 
-- **Triggers.** A push to `main` that touches `src/**`, `test/**`, `scripts/**`, `wrangler.jsonc`, `package.json`, or the
-  workflow file itself, plus manual `workflow_dispatch`. It does **not** deploy
-  on pull requests or on pushes to other branches.
-- **Main-only guard.** Because `workflow_dispatch` can be started from any
-  branch, the deploy job is gated with `if: github.ref == 'refs/heads/main'`
-  and a defense-in-depth step asserts the ref before checkout; the checkout is
-  also pinned to `ref: main`. A manual run from a non-`main` branch therefore
-  never deploys that branch's source to the production Worker.
-- **Install.** Dependencies are installed reproducibly with `npm ci`.
-- **Checks.** `npm run check:canonical` (a guard that fails if a second
-  Wrangler config or Worker entry point is present, or if the canonical
-  `wrangler.jsonc` `main` does not resolve to `src/index.js`), `npm run lint`,
-  `npm test`, and `npm run deploy:dry-run` all run before deploy.
-- **Deploy.** On a qualifying push to `main`, and only if the checks pass, the
-  workflow runs `npm run deploy` using the `CLOUDFLARE_API_TOKEN` and
-  `CLOUDFLARE_ACCOUNT_ID` repository secrets, then records the deployed commit
-  SHA and workflow run URL.
+- **`ci.yml` (validation only).** Runs on every pull request and on pushes to
+  non-`main` branches. It installs with `npm ci` and runs `check:canonical`,
+  `lint`, `test`, and `deploy:dry-run`. It references **no secrets** and
+  **never deploys**, so it is safe to run against untrusted pull-request code.
+- **`deploy.yml` (manual production deployment only).** It has **no `push`
+  trigger** — merging a PR to `main` cannot deploy. It is started only by
+  `workflow_dispatch` from `main`, and the deploy job is gated by:
+  - `if: github.ref == 'refs/heads/main'` plus a defense-in-depth step that
+    fails if the ref is not `refs/heads/main`;
+  - a checkout pinned to `ref: main`;
+  - the **`production` GitHub environment**, which must be configured with at
+    least one required reviewer so the deploy waits for an independent
+    approval.
+- **Checks before deploy.** `npm run check:canonical`, `npm run lint`,
+  `npm test`, and `npm run deploy:dry-run` all run before `npm run deploy`.
+- **Deploy.** Only after the checks and the environment approval, the workflow
+  runs `npm run deploy` using `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`,
+  then records the deployed commit SHA and workflow run URL.
 - **Smoke test.** An automated post-deploy smoke test verifies `/health` and `/ready` against the deployed endpoint.
+
+> **Owner action required.** Removing the `push` trigger stops *GitHub Actions*
+> from deploying on merge, but the **Cloudflare Git integration is a separate
+> deployment path**. Automatic production deployment from Cloudflare must be
+> disabled in the Cloudflare dashboard (Workers & Pages → the Worker →
+> Settings → Builds & deployments), keeping preview deployments separate from
+> production if previews are still wanted. Creating the `production`
+> environment with required reviewers is also an owner-side GitHub setting.
+> See "Deployment prerequisites and owner actions" below.
+
+### Deployment prerequisites and owner actions
+
+These are **owner-only GitHub/Cloudflare settings**, not repository files. The
+repository changes are complete on their own, but the following must be
+configured for the manual gate to be effective:
+
+1. **Create the `production` environment** (GitHub → Settings → Environments).
+   Add **at least one required reviewer**; enable **Prevent self-review** if the
+   plan supports it, so the person who starts the deploy cannot also approve it.
+2. **Restrict the environment's deployment branches.** Do **not** assume `main`
+   is a protected branch. Either
+   - add an explicit **deployment branch rule allowing `main`**, or
+   - first **enable branch protection on `main`**, then select
+     *Protected branches only*.
+3. **Scope production credentials to the environment.** Move
+   `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from repository secrets
+   into the **`production` environment** secrets, so no other workflow (and no
+   pull-request validation) can read them.
+4. **Disable automatic production deployment in Cloudflare.** In the Cloudflare
+   dashboard, open *Workers & Pages → the Worker → Settings → Builds &
+   deployments* and turn off the automatic **production** deployment for the
+   connected Git repository. Keep **preview** deployments separate from
+   production; disabling previews is optional. Without this step, a push to
+   `main` (including a merge) can still be deployed by Cloudflare even though
+   GitHub Actions no longer deploys.
+
+### Known external gate
+
+The Cloudflare "Workers Builds" check is a **Cloudflare-side** integration, not
+a GitHub Actions workflow. It is reported on pull requests by the
+`cloudflare-workers-and-pages` app and cannot be disabled from this repository.
+
+
