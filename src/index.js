@@ -802,6 +802,138 @@ export function safeResponseHeaders(headers) {
   return result;
 }
 
+// Headers that are meaningful only for a single hop and must never be relayed
+// to the upstream (RFC 9110 §7.6.1). `transfer-encoding` and `content-length`
+// are recomputed by the runtime from the actual body it sends.
+const HOP_BY_HOP_REQUEST_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+];
+
+// Credential/session material that belongs to the downstream caller and must
+// not reach NVIDIA: the caller's own `Authorization`, the proxy shared secret,
+// and any cookie state. The NVIDIA `Authorization` is set separately from the
+// Worker secret, overwriting whatever the client supplied.
+const SENSITIVE_REQUEST_HEADERS = [
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "cookie2",
+  "set-cookie",
+  "set-cookie2",
+  "x-proxy-key",
+];
+
+// Forwarding/topology metadata (RFC 9110 §7.6.3). A transparent API gateway
+// must not disclose the caller's IP, internal hostnames, or intermediate
+// proxies to the upstream, and must not let a client spoof the request chain.
+const TOPOLOGY_REQUEST_HEADERS = [
+  "forwarded",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-forwarded-port",
+  "x-real-ip",
+  "via",
+  "cdn-loop",
+  "true-client-ip",
+];
+
+// Platform/runtime headers injected by the edge (Cloudflare `cf-*`, plus any
+// `x-cloud-trace-*` handled by the infrastructure families below). They
+// disclose the caller's IP, country, edge POP, and Worker internals, and NVIDIA
+// never needs them.
+const PLATFORM_REQUEST_HEADER_PREFIXES = ["cf-"];
+
+// Body-representation metadata that describes the *original* upstream body.
+// When the proxy replaces or truncates that body (e.g. an oversized 429 body
+// is swapped for a synthetic JSON error), these headers no longer describe the
+// returned bytes and must be removed to avoid a corrupt/ambiguous response.
+const BODY_REPRESENTATION_HEADERS = [
+  "content-encoding",
+  "content-range",
+  "content-disposition",
+  "accept-ranges",
+  "etag",
+  "content-md5",
+  "digest",
+];
+
+// Build the header set forwarded to NVIDIA from the inbound client request.
+//
+// Policy: remove every hop-by-hop header and everything the `Connection`
+// header nominates, all caller credentials/session state, and all
+// forwarding/topology plus reserved tracing/infrastructure families; then set
+// `Authorization` from the Worker secret. Content negotiation and vendor
+// payload headers (`content-type`, `accept`, `openai-*`, `x-request-id`, …)
+// are preserved because the NVIDIA API relies on them.
+export function safeUpstreamRequestHeaders(headers, nvidiaApiKey) {
+  const result = new Headers(headers);
+
+  for (const name of HOP_BY_HOP_REQUEST_HEADERS) {
+    result.delete(name);
+  }
+
+  for (const name of SENSITIVE_REQUEST_HEADERS) {
+    result.delete(name);
+  }
+
+  for (const name of TOPOLOGY_REQUEST_HEADERS) {
+    result.delete(name);
+  }
+
+  for (const name of [...result.keys()]) {
+    for (const prefix of INFRASTRUCTURE_RESPONSE_HEADER_PREFIXES) {
+      if (name.startsWith(prefix)) {
+        result.delete(name);
+        break;
+      }
+    }
+  }
+
+  // Strip edge/platform headers (e.g. `cf-connecting-ip`, `cf-ipcountry`).
+  for (const name of [...result.keys()]) {
+    for (const prefix of PLATFORM_REQUEST_HEADER_PREFIXES) {
+      if (name.startsWith(prefix)) {
+        result.delete(name);
+        break;
+      }
+    }
+  }
+
+  // Remove headers nominated by the client's `Connection` header (parsed from
+  // the pre-sanitized value so a token-named header cannot survive).
+  const connectionValue = headers.get("connection");
+
+  if (connectionValue) {
+    for (const token of connectionValue.split(",")) {
+      const name = token.trim().toLowerCase();
+
+      if (name) {
+        result.delete(name);
+      }
+    }
+  }
+
+  // The runtime derives `Host` from the upstream URL and recomputes
+  // `Content-Length` from the body it actually sends; the client's values are
+  // never valid upstream.
+  result.delete("host");
+  result.delete("content-length");
+
+  if (typeof nvidiaApiKey === "string" && nvidiaApiKey.length > 0) {
+    result.set("Authorization", `Bearer ${nvidiaApiKey}`);
+  }
+
+  return result;
+}
+
 export class RateGate extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -1325,16 +1457,10 @@ export class RateGate extends DurableObject {
           NVIDIA_API
         );
 
-        const headers = new Headers(request.headers);
-
-        headers.set(
-          "Authorization",
-          `Bearer ${this.env.NVIDIA_API_KEY}`
+        const headers = safeUpstreamRequestHeaders(
+          request.headers,
+          this.env.NVIDIA_API_KEY
         );
-
-        headers.delete("host");
-        headers.delete("x-proxy-key");
-        headers.delete("content-length");
 
         let headerTimeoutId = null;
         let headerTimedOut = false;
@@ -1444,6 +1570,12 @@ export class RateGate extends DurableObject {
           : retryBodyBytes;
 
         if (retryBodyTruncated) {
+          // The upstream body was replaced with a synthetic JSON error, so any
+          // representation metadata that described the original bytes
+          // (encoding, range, validators) is no longer valid and is removed.
+          for (const name of BODY_REPRESENTATION_HEADERS) {
+            retryHeaders.delete(name);
+          }
           retryHeaders.set("content-type", "application/json");
         }
 

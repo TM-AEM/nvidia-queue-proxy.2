@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="ar">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Queue Test</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 44rem; margin: 2rem auto; padding: 0 1rem; }
+  label { display: block; margin-top: 0.75rem; font-weight: 600; }
+  input { width: 100%; padding: 0.4rem; box-sizing: border-box; }
+  pre { background: #0b0f17; color: #e5e7eb; padding: 1rem; border-radius: 6px; white-space: pre-wrap; }
+  .warn { background: #fef3c7; border: 1px solid #f59e0b; padding: 0.75rem; border-radius: 6px; }
+</style>
+
+<h3>اختبار طابور البروكسي</h3>
+
+<p class="warn">
+  هذا الاختبار يُرسل طلبات استدلال حقيقية إلى NVIDIA عبر البروكسي، وسيستهلك حصة
+  الاستدلال (قد تكون مدفوعة). لا تُشارك مفتاح PROXY_KEY مع أي طرف غير موثوق، وأي
+  مفتاح يُدخَل هنا يبقى ظاهرًا لمستخدم المتصفح.
+</p>
+
+<p>أدخل عنوان البروكسي ومفتاح PROXY_KEY فقط (وليس مفتاح NVIDIA).</p>
+
+<label for="url">عنوان البروكسي (Base URL)</label>
+<input id="url" type="text" placeholder="https://<worker>.<subdomain>.workers.dev" autocomplete="off">
+
+<label for="key">PROXY_KEY</label>
+<input id="key" type="password" placeholder="PROXY_KEY" autocomplete="off">
+
+<label for="model">اسم الموديل (اختياري)</label>
+<input id="model" type="text" value="nvidia/nemotron-3.5-super-vl-120b-a12b" autocomplete="off">
+
+<button id="run" onclick="runTest()">اختبر 3 طلبات</button>
+<pre id="out">جاهز للاختبار</pre>
+
+<script>
+// Standalone developer harness. It is NOT part of the deployed Worker
+// (wrangler.jsonc deploys only src/index.js) and is not run by `npm test`.
+// The endpoint is entered at runtime so no stale workers.dev host is embedded.
+
+const REQUEST_TIMEOUT_MS = 120000;
+
+async function runTest() {
+  const baseUrl = document.getElementById("url").value.trim().replace(/\/+$/, "");
+  const key = document.getElementById("key").value.trim();
+  const model = document.getElementById("model").value.trim();
+  const out = document.getElementById("out");
+  const button = document.getElementById("run");
+
+  if (!baseUrl) {
+    out.textContent = "أدخل عنوان البروكسي أولًا.";
+    return;
+  }
+
+  if (!key) {
+    out.textContent = "أدخل PROXY_KEY أولًا.";
+    return;
+  }
+
+  const url = baseUrl + "/v1/chat/completions";
+
+  button.disabled = true;
+  out.textContent = "جارٍ إرسال 3 طلبات استدلال حقيقية بالتزامن...";
+
+  const body = {
+    model: model || undefined,
+    messages: [{ role: "user", content: "Reply with OK" }],
+    max_tokens: 100,
+    stream: false
+  };
+
+  try {
+    const results = await Promise.all([1, 2, 3].map(async (n) => {
+      const start = performance.now();
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + key
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal
+        });
+
+        await response.text();
+
+        return `الطلب ${n}: HTTP ${response.status} — ${Math.round(performance.now() - start)} ms`;
+      } catch (error) {
+        const label = error.name === "AbortError" ? "انتهت المهلة" : "فشل الاتصال";
+        return `الطلب ${n}: ${label} — ${error.message}`;
+      } finally {
+        clearTimeout(timer);
+      }
+    }));
+
+    // Only status codes and timings are shown; the key and response bodies are
+    // never echoed into the page.
+    out.textContent = results.join("\n");
+  } finally {
+    button.disabled = false;
+  }
+}
+</script>
+</html>

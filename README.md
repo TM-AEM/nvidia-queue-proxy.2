@@ -341,6 +341,39 @@ The original `Retry-After` value is preserved on the downstream `429` response
 exactly once on every terminal path, and cancellation/timeout cannot trigger a
 retry after the request has finished.
 
+## Request header policy
+
+### Upstream request header sanitization
+
+Before a request is forwarded to NVIDIA, the inbound client header set is
+filtered with a **denylist** so content-negotiation and vendor payload headers
+keep working. The following are removed:
+
+- the HTTP/1.1 hop-by-hop set (RFC 9110 §7.6.1): `Connection`, `Keep-Alive`,
+  `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`,
+  `Transfer-Encoding`, `Upgrade`;
+- every header **named by the client `Connection` header**;
+- caller credentials and session state: the client `Authorization`,
+  `Proxy-Authorization`, `Cookie`/`Cookie2`, `Set-Cookie`/`Set-Cookie2`, and the
+  proxy secret `X-Proxy-Key`;
+- forwarding/topology headers so the caller's IP and internal hosts are not
+  disclosed upstream: `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`,
+  `X-Forwarded-Proto`, `X-Forwarded-Port`, `X-Real-IP`, `Via`, `True-Client-IP`,
+  `CDN-Loop`;
+- edge/platform headers injected by the runtime that reveal the caller's IP,
+  country, or edge POP: the `cf-*` family (`CF-Connecting-IP`, `CF-IPCountry`,
+  …);
+- the reserved distributed-tracing/platform-internal families listed under the
+  response policy (`x-amz-`, `x-b3-`, `grpc-`, `traceparent`, …);
+- `Host` and `Content-Length`, which the runtime recomputes for the upstream
+  request.
+
+The outbound `Authorization` header is then **set from the `NVIDIA_API_KEY`
+Worker secret**, overwriting any client-supplied value; a client can never
+inject or override the upstream credential. Documented content negotiation
+(`Content-Type`, `Accept`) and neutral vendor headers (`openai-*`,
+`x-request-id`, …) are preserved.
+
 ## Response header policy
 
 ### Upstream response header sanitization
@@ -506,11 +539,14 @@ appears in shell history. Do not add the literal key to a `curl -H` argument.
 
 There is also a tracked manual harness at `src/queue-test.html`: a standalone
 browser page (Arabic UI) that fires three concurrent `POST /v1/chat/completions`
-requests to test queueing. It hardcodes a specific `workers.dev` host and a
-sample model, and it does not test `/health` or `/ready`. It is a convenience
+requests to test queueing. The endpoint URL, `PROXY_KEY`, and model are entered
+at runtime, so no `workers.dev` host or credential is embedded in the page, and
+the page reports only status codes and timings. It issues **real, billable**
+inference requests and does not test `/health` or `/ready`. It is a convenience
 tool, not part of the deployed Worker (`wrangler.jsonc` deploys only
-`src/index.js`) and not part of `npm test`; treat it as a development aid and do
-not rely on its embedded host for operations.
+`src/index.js`) and not part of `npm test`; treat it as a development aid and
+run it only against a local Worker or an explicitly authorized test
+environment.
 
 ## Cancellation limitations
 
@@ -640,15 +676,71 @@ Complete these in order for an authorized release:
 
 ## Continuous integration and deployment
 
-The repository ships a GitHub Actions workflow
-(`.github/workflows/deploy.yml`) that both tests and deploys the Worker:
+CI and production deployment are **deliberately separated**:
 
-- **Triggers.** A push to `main` that touches `src/**`, `test/**`, `wrangler.jsonc`, `package.json`, or the
-  workflow file itself, plus manual `workflow_dispatch`. It does **not** deploy
-  on pull requests or on pushes to other branches.
-- **Install.** Dependencies are installed reproducibly with `npm ci`.
-- **Checks.** `npm test` and `npm run deploy:dry-run` run before deploy.
-- **Deploy.** On a qualifying push to `main`, and only if the checks pass, the
-  workflow runs `npm run deploy` using the `CLOUDFLARE_API_TOKEN` and
-  `CLOUDFLARE_ACCOUNT_ID` repository secrets.
+- **`ci.yml` (validation only).** Runs on every pull request and on pushes to
+  non-`main` branches. It installs with `npm ci` and runs `check:canonical`,
+  `lint`, `test`, and `deploy:dry-run`. It references **no secrets** and
+  **never deploys**, so it is safe to run against untrusted pull-request code.
+- **`deploy.yml` (manual production deployment only).** It has **no `push`
+  trigger** — merging a PR to `main` cannot deploy. It is started only by
+  `workflow_dispatch` from `main`, and the deploy job is gated by:
+  - `if: github.ref == 'refs/heads/main'` plus a defense-in-depth step that
+    fails if the ref is not `refs/heads/main`;
+  - a checkout pinned to `ref: main`;
+  - the **`production` GitHub environment**, which must be configured with at
+    least one required reviewer so the deploy waits for an independent
+    approval.
+- **Checks before deploy.** `npm run check:canonical`, `npm run lint`,
+  `npm test`, and `npm run deploy:dry-run` all run before `npm run deploy`.
+- **Pinned actions.** Every third-party action is pinned to an immutable commit
+  SHA (for example `actions/checkout@11d5960a… # v4.4.0`) rather than a mutable
+  tag, so an upstream tag move cannot inject unreviewed code into a job that
+  holds production credentials.
+- **Deploy.** Only after the checks and the environment approval, the workflow
+  runs `npm run deploy` using `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`,
+  then records the deployed commit SHA and workflow run URL.
 - **Smoke test.** An automated post-deploy smoke test verifies `/health` and `/ready` against the deployed endpoint.
+
+> **Owner action required.** Removing the `push` trigger stops *GitHub Actions*
+> from deploying on merge, but the **Cloudflare Git integration is a separate
+> deployment path**. Automatic production deployment from Cloudflare must be
+> disabled in the Cloudflare dashboard (Workers & Pages → the Worker →
+> Settings → Builds & deployments), keeping preview deployments separate from
+> production if previews are still wanted. Creating the `production`
+> environment with required reviewers is also an owner-side GitHub setting.
+> See "Deployment prerequisites and owner actions" below.
+
+### Deployment prerequisites and owner actions
+
+These are **owner-only GitHub/Cloudflare settings**, not repository files. The
+repository changes are complete on their own, but the following must be
+configured for the manual gate to be effective:
+
+1. **Create the `production` environment** (GitHub → Settings → Environments).
+   Add **at least one required reviewer**; enable **Prevent self-review** if the
+   plan supports it, so the person who starts the deploy cannot also approve it.
+2. **Restrict the environment's deployment branches.** Do **not** assume `main`
+   is a protected branch. Either
+   - add an explicit **deployment branch rule allowing `main`**, or
+   - first **enable branch protection on `main`**, then select
+     *Protected branches only*.
+3. **Scope production credentials to the environment.** Move
+   `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from repository secrets
+   into the **`production` environment** secrets, so no other workflow (and no
+   pull-request validation) can read them.
+4. **Disable automatic production deployment in Cloudflare.** In the Cloudflare
+   dashboard, open *Workers & Pages → the Worker → Settings → Builds &
+   deployments* and turn off the automatic **production** deployment for the
+   connected Git repository. Keep **preview** deployments separate from
+   production; disabling previews is optional. Without this step, a push to
+   `main` (including a merge) can still be deployed by Cloudflare even though
+   GitHub Actions no longer deploys.
+
+### Known external gate
+
+The Cloudflare "Workers Builds" check is a **Cloudflare-side** integration, not
+a GitHub Actions workflow. It is reported on pull requests by the
+`cloudflare-workers-and-pages` app and cannot be disabled from this repository.
+
+
