@@ -693,6 +693,10 @@ CI and production deployment are **deliberately separated**:
     approval.
 - **Checks before deploy.** `npm run check:canonical`, `npm run lint`,
   `npm test`, and `npm run deploy:dry-run` all run before `npm run deploy`.
+- **Pinned actions.** Every third-party action is pinned to an immutable commit
+  SHA (for example `actions/checkout@11d5960a… # v4.4.0`) rather than a mutable
+  tag, so an upstream tag move cannot inject unreviewed code into a job that
+  holds production credentials.
 - **Deploy.** Only after the checks and the environment approval, the workflow
   runs `npm run deploy` using `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`,
   then records the deployed commit SHA and workflow run URL.

@@ -82,8 +82,13 @@ function assertEnvironmentGate(yml, label) {
   );
 }
 
+// Matches a real `npm run deploy` invocation while excluding `deploy:dry-run`.
+// It deliberately does not require end-of-line so that a flagged invocation
+// (`npm run deploy --env production`) is still detected.
+const DEPLOY_INVOCATION = /npm run deploy(?!:)/g;
+
 function assertSingleDeployInvocation(yml, label) {
-  const deployCalls = yml.match(/npm run deploy\s*$/gm) ?? [];
+  const deployCalls = yml.match(DEPLOY_INVOCATION) ?? [];
   assert.equal(
     deployCalls.length,
     1,
@@ -163,7 +168,8 @@ test("repository: no alternate workflow can automatically deploy to production",
   for (const name of listWorkflows()) {
     const yml = readWorkflow(name);
     const deploys =
-      /npm run deploy\s*$/m.test(yml) || /wrangler deploy(?!\s*--dry-run)/.test(yml);
+      new RegExp(DEPLOY_INVOCATION.source).test(yml) ||
+      /wrangler deploy(?!\s*--dry-run)/.test(yml);
     if (!deploys) continue;
 
     const block = triggerBlock(yml);
@@ -179,6 +185,68 @@ test("repository: no alternate workflow can automatically deploy to production",
     `workflows with an automatic trigger that also deploy: ${offenders.join(", ") || "(none)"}`
   );
 });
+
+// The smoke-test workflow chains off the deploy workflow by *name*
+// (`workflow_run.workflows`). If the deploy workflow is renamed without
+// updating the reference, the post-deploy smoke test silently stops running.
+test("smoke-test workflow: workflow_run references the actual deploy workflow name", () => {
+  const deployName = readWorkflow("deploy.yml").match(/^name:\s*(.+)$/m)?.[1].trim();
+  assert.ok(deployName, "deploy.yml must declare a name");
+
+  const smoke = readWorkflow("production-smoke-test.yml");
+  assert.match(
+    smoke,
+    new RegExp(`workflows:\\s*\\["${deployName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"\\]`),
+    `the smoke test must reference the deploy workflow by its exact name (${deployName})`
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Supply-chain: every third-party action must be pinned to an immutable commit
+// SHA. A mutable tag (`@v4`) can be repointed by the upstream owner and would
+// then run unreviewed code inside a job that holds production credentials.
+// ---------------------------------------------------------------------------
+
+function assertActionsPinnedToSha(yml, label) {
+  const usesLines = yml.match(/^\s*uses:\s*\S+/gm) ?? [];
+  assert.ok(usesLines.length > 0, `${label}: expected at least one \`uses:\` reference`);
+  for (const line of usesLines) {
+    const ref = line.replace(/^\s*uses:\s*/, "").trim();
+    assert.match(
+      ref,
+      /^[^@\s]+@[0-9a-f]{40}$/,
+      `${label}: action \`${ref}\` must be pinned to a full 40-char commit SHA`
+    );
+  }
+}
+
+function assertNoProductionSecretsOutsideDeploy(yml, label) {
+  assert.doesNotMatch(
+    yml,
+    /secrets\.(CLOUDFLARE_API_TOKEN|CLOUDFLARE_ACCOUNT_ID)/,
+    `${label}: production Cloudflare credentials must not be referenced here`
+  );
+}
+
+test("all workflows: every action is pinned to an immutable commit SHA", () => {
+  for (const name of listWorkflows()) {
+    assertActionsPinnedToSha(readWorkflow(name), name);
+  }
+});
+
+test("all workflows: production Cloudflare secrets appear only in the gated deploy workflow", () => {
+  for (const name of listWorkflows()) {
+    if (name === "deploy.yml") continue;
+    assertNoProductionSecretsOutsideDeploy(readWorkflow(name), name);
+  }
+});
+
+test("deploy workflow: production Cloudflare secrets are consumed there", () => {
+  const yml = readWorkflow("deploy.yml");
+  assert.match(yml, /secrets\.CLOUDFLARE_API_TOKEN/, "deploy.yml must read CLOUDFLARE_API_TOKEN");
+  assert.match(yml, /secrets\.CLOUDFLARE_ACCOUNT_ID/, "deploy.yml must read CLOUDFLARE_ACCOUNT_ID");
+});
+
 
 // ---------------------------------------------------------------------------
 // Mutation tests: prove each guard assertion fails when the guard is removed or
@@ -230,6 +298,42 @@ const mutations = [
     name: "a second deploy invocation is caught",
     yml: `${DEPLOY}\n      - name: sneaky\n        run: npm run deploy\n`,
     check: (yml) => assertSingleDeployInvocation(yml, "mutated"),
+  },
+  {
+    name: "unpinning an action back to a mutable tag is caught",
+    yml: DEPLOY.replace(
+      /uses: actions\/checkout@[0-9a-f]{40}/,
+      "uses: actions/checkout@v4"
+    ),
+    check: (yml) => assertActionsPinnedToSha(yml, "mutated"),
+  },
+  {
+    name: "leaking a production secret into the CI workflow is caught",
+    yml:
+      readWorkflow("ci.yml") +
+      '\n      - run: echo "$' +
+      "{{ secrets.CLOUDFLARE_API_TOKEN }}\"\n",
+    check: (yml) => assertNoProductionSecretsOutsideDeploy(yml, "mutated"),
+  },
+  {
+    name: "a flagged second deploy invocation is caught",
+    yml: `${DEPLOY}\n      - name: sneaky\n        run: npm run deploy --env production\n`,
+    check: (yml) => assertSingleDeployInvocation(yml, "mutated"),
+  },
+  {
+    name: "a renamed deploy workflow breaking the smoke-test reference is caught",
+    yml: readWorkflow("production-smoke-test.yml").replace(
+      /workflows:\s*\["Test and Deploy NVIDIA Queue Proxy"\]/,
+      'workflows: ["Renamed Deploy Workflow"]'
+    ),
+    check: (yml) => {
+      const deployName = "Test and Deploy NVIDIA Queue Proxy";
+      assert.match(
+        yml,
+        new RegExp(`workflows:\\s*\\["${deployName}"\\]`),
+        "mutated: smoke test must reference the exact deploy workflow name"
+      );
+    },
   },
 ];
 
