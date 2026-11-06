@@ -169,3 +169,35 @@ test("AUDIT-12 runtime: /ready reports 503 with not-ready checks when required s
     await mf.dispose();
   }
 });
+
+test("NQP-DEF-04 runtime: proxy accepts case-insensitive bearer and trimmed x-proxy-key", async () => {
+  const upstreamCalls = [];
+  const mf = createRuntime(upstreamCalls);
+  try {
+    // 1. Lowercase "bearer"
+    const res1 = await mf.dispatchFetch("https://proxy.local/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `bearer ${TEST_BINDINGS.PROXY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "test-model", messages: [{ role: "user", content: "test 1" }] }),
+    });
+    assert.equal(res1.status, 200, "lowercase bearer must be authorized in runtime");
+
+    // 2. x-proxy-key with leading/trailing spaces
+    const res2 = await mf.dispatchFetch("https://proxy.local/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "x-proxy-key": `  ${TEST_BINDINGS.PROXY_KEY}  `,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "test-model", messages: [{ role: "user", content: "test 2" }] }),
+    });
+    assert.equal(res2.status, 200, "trimmed x-proxy-key must be authorized in runtime");
+    assert.equal(upstreamCalls.length, 2, "both valid auth styles must reach upstream");
+  } finally {
+    await mf.dispose();
+  }
+});
+

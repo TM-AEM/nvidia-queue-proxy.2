@@ -31,7 +31,7 @@ interface TestResult {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<"tester" | "architecture" | "config" | "audit">("tester");
-  const [endpointUrl, setEndpointUrl] = useState("https://nvidia-queue-proxy.5s5k7kk.workers.dev");
+  const [endpointUrl, setEndpointUrl] = useState("https://nvidia-queue-proxy-2.5s5k7kk.workers.dev");
   const [proxyKey, setProxyKey] = useState("");
   const [isRunningTest, setIsRunningTest] = useState(false);
   const [testResults, setTestResults] = useState<TestResult[]>([]);
@@ -46,11 +46,12 @@ export default function App() {
   const runProbe = async (type: "health" | "ready" | "burst" | "chat") => {
     setIsRunningTest(true);
     const now = new Date().toLocaleTimeString();
+    const base = endpointUrl.trim().replace(/\/+$/, "");
 
     if (type === "health") {
       const start = performance.now();
       try {
-        const res = await fetch(`${endpointUrl.replace(/\/$/, "")}/health`);
+        const res = await fetch(`${base}/health`);
         const duration = Math.round(performance.now() - start);
         const data = await res.json().catch(() => ({ status: res.statusText }));
         setTestResults(prev => [
@@ -81,7 +82,7 @@ export default function App() {
     } else if (type === "ready") {
       const start = performance.now();
       try {
-        const res = await fetch(`${endpointUrl.replace(/\/$/, "")}/ready`);
+        const res = await fetch(`${base}/ready`);
         const duration = Math.round(performance.now() - start);
         const data = await res.json().catch(() => ({ status: res.statusText }));
         setTestResults(prev => [
@@ -114,7 +115,7 @@ export default function App() {
       const promises = Array.from({ length: count }).map(async (_, idx) => {
         const start = performance.now();
         try {
-          const res = await fetch(`${endpointUrl.replace(/\/$/, "")}/v1/chat/completions`, {
+          const res = await fetch(`${base}/v1/chat/completions`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
@@ -153,7 +154,7 @@ export default function App() {
     } else if (type === "chat") {
       const start = performance.now();
       try {
-        const res = await fetch(`${endpointUrl.replace(/\/$/, "")}/v1/chat/completions`, {
+        const res = await fetch(`${base}/v1/chat/completions`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -227,7 +228,7 @@ export default function App() {
           <div className="flex items-center gap-2 text-xs">
             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-950/60 border border-emerald-500/30 text-emerald-400">
               <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span>194 / 194 Tests Passing</span>
+              <span>238 / 238 Tests Passing</span>
             </div>
             <div className="hidden sm:flex items-center gap-1 px-2.5 py-1 rounded-full bg-slate-800/80 border border-slate-700/60 text-slate-300 font-mono">
               <Server className="w-3.5 h-3.5 text-slate-400" />
@@ -358,7 +359,7 @@ export default function App() {
                       type="text"
                       value={endpointUrl}
                       onChange={e => setEndpointUrl(e.target.value)}
-                      placeholder="https://nvidia-queue-proxy.5s5k7kk.workers.dev"
+                      placeholder="https://nvidia-queue-proxy-2.5s5k7kk.workers.dev"
                       className="w-full bg-[#070A0F] border border-slate-700/80 rounded-lg px-3.5 py-2 text-xs font-mono text-white placeholder-slate-600 focus:outline-none focus:border-[#76B900]"
                     />
                   </div>
@@ -796,7 +797,7 @@ npm run deploy`}
                     id: "AUDIT-10 (#14)",
                     title: "Final release verification & test suite",
                     status: "PASS",
-                    notes: "194/194 tests passing across unit, Miniflare runtime, and smoke-validator suites.",
+                    notes: "238/238 tests passing across unit, Miniflare runtime, smoke-validator, and workflow security suites.",
                   },
                 ].map(item => (
                   <div key={item.id} className="p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
