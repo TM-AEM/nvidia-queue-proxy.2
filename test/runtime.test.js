@@ -201,3 +201,47 @@ test("NQP-DEF-04 runtime: proxy accepts case-insensitive bearer and trimmed x-pr
   }
 });
 
+test("REQUEST_BODY_TIMEOUT_MS runtime: stalled body returns HTTP 408 and stops upstream dispatch in workerd", async () => {
+  const upstreamCalls = [];
+  // Configure a short 1000ms body timeout for runtime test
+  const mf = createRuntime(upstreamCalls, { REQUEST_BODY_TIMEOUT_MS: "1000" });
+  try {
+    // Create a stream that emits one chunk then stalls forever
+    const stalledStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"model":"test-model"'));
+      },
+    });
+
+    const res = await mf.dispatchFetch("https://proxy.local/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TEST_BINDINGS.PROXY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: stalledStream,
+      duplex: "half",
+    });
+
+    assert.equal(res.status, 408, "Stalled request body must return 408 in workerd runtime");
+    const json = await res.json();
+    assert.deepEqual(json, { error: "Request body read timed out" });
+    assert.equal(upstreamCalls.length, 0, "No upstream request may be dispatched after a body timeout");
+
+    // A normal fast request afterwards must succeed cleanly in the same runtime
+    const okRes = await mf.dispatchFetch("https://proxy.local/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TEST_BINDINGS.PROXY_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "test-model", messages: [{ role: "user", content: "ok" }] }),
+    });
+    assert.equal(okRes.status, 200, "Subsequent request must succeed cleanly");
+    assert.equal(upstreamCalls.length, 1, "Upstream must receive the subsequent valid request");
+  } finally {
+    await mf.dispose();
+  }
+});
+
+

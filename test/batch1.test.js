@@ -7448,4 +7448,153 @@ test("NQP-DEF-04: Worker accepts 'bearer <key>' in any case and trims whitespace
   assert.equal(noSpace.status, 401, "Bearer without space must be rejected with 401");
 });
 
+// ==========================================
+// REQUEST_BODY_TIMEOUT_MS: Targeted regression tests
+// ==========================================
+test("REQUEST_BODY_TIMEOUT_MS: chunked body without Content-Length times out with 408 and clean accounting", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+  const body = createControllableBody();
+  let upstreamCalled = false;
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    REQUEST_BODY_TIMEOUT_MS: 3_000,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => {
+      upstreamCalled = true;
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  const rateGate = new RateGate(ctx, env);
+  // Deliberately omit Content-Length header to test chunked transfer
+  const req = new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: body.stream,
+    duplex: "half",
+  });
+
+  const resPromise = rateGate.fetch(req);
+  await tick();
+
+  // Feed one initial chunk
+  body.state.push(new Uint8Array([1, 2, 3]));
+  await tick();
+
+  assert.equal(rateGate.activeBodyReads, 1, "Concurrency slot held while reading");
+  assert.equal(rateGate.activeBodyBytes, 3, "Memory reserved for received chunk");
+
+  // Advance time past the 3,000ms deadline
+  timers.advance(3_000);
+  timers.advance(1_000); // cancel grace
+
+  const res = await resPromise;
+  assert.equal(res.status, 408, "Stalled chunked body must return 408");
+  const data = await res.json();
+  assert.equal(data.error, "Request body read timed out");
+  assert.equal(upstreamCalled, false, "Upstream must never be dispatched on timeout");
+  assert.equal(rateGate.activeTicket, null, "Queue ticket must not be held");
+  assert.equal(rateGate.activeBodyReads, 0, "Body-read concurrency must be released");
+  assert.equal(rateGate.activeBodyBytes, 0, "Memory reservation must be fully released");
+});
+
+test("REQUEST_BODY_TIMEOUT_MS: explicit valid configuration overrides default", () => {
+  const cfgDefault = resolveConfig({});
+  assert.equal(cfgDefault.REQUEST_BODY_TIMEOUT_MS, 30_000, "Default must be 30000ms");
+
+  const cfgCustom = resolveConfig({ REQUEST_BODY_TIMEOUT_MS: "45000" });
+  assert.equal(cfgCustom.REQUEST_BODY_TIMEOUT_MS, 45_000, "Explicit override must be respected");
+
+  const cfgMin = resolveConfig({ REQUEST_BODY_TIMEOUT_MS: 1_000 });
+  assert.equal(cfgMin.REQUEST_BODY_TIMEOUT_MS, 1_000, "Minimum 1000ms accepted");
+
+  const cfgMax = resolveConfig({ REQUEST_BODY_TIMEOUT_MS: 120_000 });
+  assert.equal(cfgMax.REQUEST_BODY_TIMEOUT_MS, 120_000, "Maximum 120000ms accepted");
+});
+
+test("REQUEST_BODY_TIMEOUT_MS: concurrent requests with timeout races do not leak concurrency or memory", async () => {
+  const clock = new FakeClock(0);
+  const ctx = createMockCtx();
+  const timers = createFakeTimers();
+  const body1 = createControllableBody();
+  const body2 = createControllableBody();
+  const body3 = createControllableBody();
+
+  const env = {
+    RPM: 10,
+    COOLDOWN_MS: 0,
+    REQUEST_BODY_TIMEOUT_MS: 2_000,
+    MAX_CONCURRENT_BODY_READS: 5,
+    MAX_AGGREGATE_BODY_BYTES: 1024 * 1024,
+    NVIDIA_API_KEY: "test-key",
+    __now: () => clock.now(),
+    __sleep: (ms, signal) => clock.sleep(ms, signal),
+    __setTimeout: (fn, ms) => timers.setTimeout(fn, ms),
+    __clearTimeout: (id) => timers.clearTimeout(id),
+    __fetch: async () => new Response("ok", { status: 200 }),
+  };
+
+  const rateGate = new RateGate(ctx, env);
+
+  const p1 = rateGate.fetch(new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-length": "10" },
+    body: body1.stream,
+    duplex: "half",
+  }));
+  const p2 = rateGate.fetch(new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-length": "20" },
+    body: body2.stream,
+    duplex: "half",
+  }));
+  const p3 = rateGate.fetch(new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-length": "30" },
+    body: body3.stream,
+    duplex: "half",
+  }));
+
+  await tick();
+  assert.equal(rateGate.activeBodyReads, 3);
+  assert.equal(rateGate.activeBodyBytes, 60);
+
+  // Request 1 succeeds before timeout
+  body1.state.push(new Uint8Array(10));
+  body1.state.close();
+  const res1 = await p1;
+  assert.equal(res1.status, 200);
+  await res1.text();
+
+  // Requests 2 & 3 stall and time out
+  timers.advance(2_000);
+  timers.advance(1_000); // cancel grace
+
+  const res2 = await p2;
+  const res3 = await p3;
+  assert.equal(res2.status, 408);
+  assert.equal(res3.status, 408);
+
+  // All concurrency and byte accounting must be completely clean
+  assert.equal(rateGate.activeBodyReads, 0, "All read slots returned");
+  assert.equal(rateGate.activeBodyBytes, 0, "All byte reservations returned");
+
+  // Subsequent request succeeds cleanly with no stale state
+  const res4 = await rateGate.fetch(new Request("https://proxy.internal/v1/chat/completions", {
+    method: "POST",
+    body: "{}",
+  }));
+  assert.equal(res4.status, 200);
+  await res4.text();
+});
+
+
 
