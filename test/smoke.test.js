@@ -11,6 +11,7 @@ import {
   validateHealthResponse,
   validateReadyResponse,
   validateUnauthenticatedModelsResponse,
+  validateInvalidCredentialsResponse,
   validateAuthenticatedModelsResponse,
 } from "../scripts/smoke-http-validate.js";
 
@@ -176,6 +177,14 @@ test("HTTP Response Validator: unauthenticated /v1/models expects HTTP 401", () 
   assert.equal(validateUnauthenticatedModelsResponse(200).ok, false);
   assert.equal(validateUnauthenticatedModelsResponse(404).ok, false);
   assert.equal(validateUnauthenticatedModelsResponse(500).ok, false);
+});
+
+test("HTTP Response Validator: invalid credentials /v1/models expects HTTP 401", () => {
+  assert.deepEqual(validateInvalidCredentialsResponse(401), { ok: true });
+  assert.deepEqual(validateInvalidCredentialsResponse("401"), { ok: true });
+  assert.equal(validateInvalidCredentialsResponse(200).ok, false);
+  assert.equal(validateInvalidCredentialsResponse(404).ok, false);
+  assert.equal(validateInvalidCredentialsResponse(500).ok, false);
 });
 
 test("HTTP Response Validator: authenticated /v1/models expects HTTP 404", () => {

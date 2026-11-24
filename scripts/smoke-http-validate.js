@@ -77,6 +77,20 @@ export function validateUnauthenticatedModelsResponse(statusCode) {
 }
 
 /**
+ * Validates invalid credentials response: must be HTTP 401.
+ *
+ * @param {string|number} statusCode
+ * @returns {{ ok: boolean, error?: string }}
+ */
+export function validateInvalidCredentialsResponse(statusCode) {
+  const code = String(statusCode).trim();
+  if (code === "401") {
+    return { ok: true };
+  }
+  return { ok: false, error: `Security check failed: expected HTTP 401 Unauthorized for invalid credentials, received HTTP ${code}` };
+}
+
+/**
  * Validates authenticated /v1/models response: must be HTTP 404.
  *
  * @param {string|number} statusCode
@@ -114,6 +128,9 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(proces
       break;
     case "unauth-models":
       result = validateUnauthenticatedModelsResponse(statusCode);
+      break;
+    case "invalid-auth-models":
+      result = validateInvalidCredentialsResponse(statusCode);
       break;
     case "auth-models":
       result = validateAuthenticatedModelsResponse(statusCode);

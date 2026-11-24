@@ -122,13 +122,40 @@ jobs:
           node scripts/smoke-http-validate.js unauth-models "$HTTP_CODE"
           echo "Check C passed: received expected HTTP 401 Unauthorized"
 
-      - name: "Check D — Authenticated Unsupported Route (GET /v1/models)"
+      - name: "Check D — Invalid Credentials Route Security (GET /v1/models)"
+        env:
+          TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
+        run: |
+          TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
+          trap 'rm -rf "${TMP_DIR:-}"' EXIT
+
+          STATUS_FILE="${TMP_DIR}/status.txt"
+
+          CURL_EXIT=0
+          curl -s -S \
+            --connect-timeout 5 \
+            --max-time 10 \
+            -o /dev/null \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer invalid-dummy-token" \
+            "${TARGET_URL}/v1/models" > "$STATUS_FILE" || CURL_EXIT=$?
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "::error::Transport error: curl failed with exit code $CURL_EXIT on invalid credentials /v1/models"
+            exit 1
+          fi
+
+          HTTP_CODE=$(cat "$STATUS_FILE")
+          node scripts/smoke-http-validate.js invalid-auth-models "$HTTP_CODE"
+          echo "Check D passed: received expected HTTP 401 Unauthorized for invalid credentials"
+
+      - name: "Check E — Authenticated Unsupported Route (GET /v1/models)"
         env:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
           PROXY_KEY: ${{ secrets.PROXY_KEY }}
         run: |
           if [ -z "$PROXY_KEY" ]; then
-            echo "Optional PROXY_KEY secret not set; skipping Check D."
+            echo "Optional PROXY_KEY secret not set; skipping Check E."
             exit 0
           fi
 
@@ -153,4 +180,4 @@ jobs:
 
           HTTP_CODE=$(cat "$STATUS_FILE")
           node scripts/smoke-http-validate.js auth-models "$HTTP_CODE"
-          echo "Check D passed: received expected HTTP 404 Not Found"
+          echo "Check E passed: received expected HTTP 404 Not Found"

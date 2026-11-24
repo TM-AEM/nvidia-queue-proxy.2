@@ -508,34 +508,56 @@ reachability, which cannot be checked without a billed inference call.
 
 ## Post-deployment smoke check
 
-Run only after an authorized deployment, against the deployed URL. It performs a
-liveness check, a readiness check, and (optionally) one authenticated request.
+Run only after an authorized deployment, against the deployed URL. The smoke-test
+plan consists strictly of zero-upstream, non-billable validation checks that verify
+the Worker's contract, health, readiness, authentication rejection, and unsupported-route
+handling without consuming inference quota or contacting NVIDIA upstream.
+
 Never paste the proxy key on a command line where it would be recorded in shell
 history; read it from an environment variable that is not echoed.
 
+### Smoke-test contract matrix
+
+| # | Check Name | Method & Path | Authentication Requirement | Expected Status | Expected Response Shape | Contacts NVIDIA Upstream |
+|---|---|---|---|---|---|---|
+| 1 | Health Probe | `GET /health` | None (unauthenticated) | `200 OK` | `{"ok":true}` | **No** (0 requests) |
+| 2 | Readiness Probe | `GET /ready` | None (unauthenticated) | `200 OK` (when ready) / `503` (if unready) | `{"ready":true,"checks":{"proxy_key":true,"upstream_key":true,"rate_gate":true}}` | **No** (0 requests) |
+| 3 | Unauthenticated Route Security | `GET /v1/models` | None (unauthenticated / missing credentials) | `401 Unauthorized` | Plain text: `Unauthorized` | **No** (0 requests) |
+| 4 | Invalid Credentials Security | `GET /v1/models` | Invalid credentials (e.g. `Bearer invalid-dummy-token`) | `401 Unauthorized` | Plain text: `Unauthorized` | **No** (0 requests) |
+| 5 | Authenticated Unsupported Route | `GET /v1/models` | Valid credentials (`Bearer ${PROXY_KEY}`) | `404 Not Found` | Plain text: `Not found` | **No** (0 requests) |
+
+> **Contract Rule**: Valid authentication does **not** make an unsupported route valid.
+> `GET /v1/models` is intentionally unsupported and returns HTTP 404 without reaching the
+> Durable Object or contacting upstream. Do not substitute production inference requests
+> (`POST /v1/chat/completions`) for post-deployment smoke verification.
+
+### Executable smoke-check commands
+
 ```bash
-# Liveness (no credentials, no upstream call)
-curl -fsS https://<deployed-host>/health
+# Check 1: Health Probe (unauthenticated, zero upstream calls)
+curl -s -S -o /dev/null -w "%{http_code}\n" https://<deployed-host>/health
+# Expected output: 200 (payload: {"ok":true})
 
-# Readiness (no credentials, no upstream call)
-curl -fsS https://<deployed-host>/ready
+# Check 2: Readiness Probe (unauthenticated, zero upstream calls)
+curl -s -S -o /dev/null -w "%{http_code}\n" https://<deployed-host>/ready
+# Expected output: 200 (payload: {"ready":true,"checks":{...}})
 
-# Authenticated round-trip (consumes one upstream inference request; run only if
-# a real request is acceptable). PROXY_KEY is read from the environment and is
-# never written to shell history or logs.
-curl -fsS -X POST https://<deployed-host>/v1/chat/completions \
+# Check 3: Unauthenticated Route Security (missing credentials, zero upstream calls)
+curl -s -S -o /dev/null -w "%{http_code}\n" https://<deployed-host>/v1/models
+# Expected output: 401 (payload: Unauthorized)
+
+# Check 4: Invalid Credentials Security (invalid credentials, zero upstream calls)
+curl -s -S -o /dev/null -w "%{http_code}\n" \
+  -H "Authorization: Bearer invalid-dummy-token" \
+  https://<deployed-host>/v1/models
+# Expected output: 401 (payload: Unauthorized)
+
+# Check 5: Authenticated Unsupported Route (valid credentials, zero upstream calls)
+curl -s -S -o /dev/null -w "%{http_code}\n" \
   -H "Authorization: Bearer ${PROXY_KEY}" \
-  -H "content-type: application/json" \
-  -d '{"model":"<model>","messages":[{"role":"user","content":"ping"}]}'
+  https://<deployed-host>/v1/models
+# Expected output: 404 (payload: Not found)
 ```
-
-The authenticated request is the only step that reaches the upstream and
-therefore the only step that can consume inference quota; it is optional and
-should be skipped when a non-billable check is required. These commands were
-**NOT RUN** in this batch: no deployment was performed.
-
-The snippets above read `PROXY_KEY` from the environment so the value never
-appears in shell history. Do not add the literal key to a `curl -H` argument.
 
 There is also a tracked manual harness at `src/queue-test.html`: a standalone
 browser page (Arabic UI) that fires three concurrent `POST /v1/chat/completions`

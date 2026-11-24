@@ -244,4 +244,67 @@ test("REQUEST_BODY_TIMEOUT_MS runtime: stalled body returns HTTP 408 and stops u
   }
 });
 
+test("route contract runtime: /v1/models and unsupported routes enforce authentication and return 404 without upstream dispatch", async () => {
+  const upstreamCalls = [];
+  const mf = createRuntime(upstreamCalls);
+  try {
+    const assertNoSecretLeak = async (res, label) => {
+      const text = await res.text();
+      assert.equal(text.includes(TEST_BINDINGS.PROXY_KEY), false, `${label}: body must not leak PROXY_KEY`);
+      assert.equal(text.includes(TEST_BINDINGS.NVIDIA_API_KEY), false, `${label}: body must not leak NVIDIA_API_KEY`);
+      for (const [name, val] of res.headers.entries()) {
+        assert.equal(val.includes(TEST_BINDINGS.PROXY_KEY), false, `${label}: header ${name} must not leak PROXY_KEY`);
+        assert.equal(val.includes(TEST_BINDINGS.NVIDIA_API_KEY), false, `${label}: header ${name} must not leak NVIDIA_API_KEY`);
+      }
+      return text;
+    };
+
+    // 1. Unauthenticated GET /v1/models -> 401
+    const unauth = await mf.dispatchFetch("https://proxy.local/v1/models", { method: "GET" });
+    assert.equal(unauth.status, 401, "unauthenticated /v1/models must be 401");
+    const unauthBody = await assertNoSecretLeak(unauth, "unauthenticated /v1/models");
+    assert.equal(unauthBody, "Unauthorized");
+    assert.equal(upstreamCalls.length, 0, "No upstream request may be issued for unauthenticated call");
+
+    // 2. Invalid Bearer credentials GET /v1/models -> 401
+    const invalidBearer = await mf.dispatchFetch("https://proxy.local/v1/models", {
+      method: "GET",
+      headers: { authorization: "Bearer invalid-dummy-token" },
+    });
+    assert.equal(invalidBearer.status, 401, "invalid credentials /v1/models must be 401");
+    const invalidBearerBody = await assertNoSecretLeak(invalidBearer, "invalid credentials /v1/models");
+    assert.equal(invalidBearerBody, "Unauthorized");
+    assert.equal(upstreamCalls.length, 0, "No upstream request may be issued for invalid credentials");
+
+    // 3. Valid credentials GET /v1/models -> 404 (valid auth does not make unsupported route valid)
+    const authedModels = await mf.dispatchFetch("https://proxy.local/v1/models", {
+      method: "GET",
+      headers: { authorization: `Bearer ${TEST_BINDINGS.PROXY_KEY}` },
+    });
+    assert.equal(authedModels.status, 404, "authenticated GET /v1/models must be 404");
+    const authedBody = await assertNoSecretLeak(authedModels, "authenticated /v1/models");
+    assert.equal(authedBody, "Not found");
+    assert.equal(upstreamCalls.length, 0, "No upstream request may be issued for unsupported route");
+
+    // 4. Valid credentials with unsupported method on valid path (e.g. GET /v1/chat/completions) -> 404
+    const authedGetChat = await mf.dispatchFetch("https://proxy.local/v1/chat/completions", {
+      method: "GET",
+      headers: { authorization: `Bearer ${TEST_BINDINGS.PROXY_KEY}` },
+    });
+    assert.equal(authedGetChat.status, 404, "authenticated GET /v1/chat/completions must be 404");
+    assert.equal(upstreamCalls.length, 0, "No upstream request may be issued for unsupported GET method");
+
+    // 5. Valid credentials outside /v1/* path -> 404
+    const outOfPath = await mf.dispatchFetch("https://proxy.local/v2/models", {
+      method: "POST",
+      headers: { authorization: `Bearer ${TEST_BINDINGS.PROXY_KEY}` },
+    });
+    assert.equal(outOfPath.status, 404, "authenticated request outside /v1/ must be 404");
+    assert.equal(upstreamCalls.length, 0, "No upstream request may be issued for route outside /v1/*");
+  } finally {
+    await mf.dispose();
+  }
+});
+
+
 

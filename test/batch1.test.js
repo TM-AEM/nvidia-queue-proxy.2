@@ -7213,12 +7213,13 @@ test("AUDIT-03: no CORS headers are emitted, and an unauthenticated OPTIONS pref
 });
 
 // `GET /v1/models` is intentionally unsupported (AUDIT-04 decision): it must
-// return 404 for an authenticated caller and never reach the Durable Object.
-test("AUDIT-04: GET /v1/models is not proxied (401 unauthenticated, 404 authenticated)", async () => {
+// return 401 unauthenticated, 401 with invalid credentials, and 404 for an
+// authenticated caller, never reaching the Durable Object or leaking secrets.
+test("AUDIT-04: GET /v1/models and unsupported routes enforce authentication and return 404 without reaching Durable Object", async () => {
   let rateGateTouched = false;
   const env = {
-    PROXY_KEY: "test-key",
-    NVIDIA_API_KEY: "test-nvidia-key",
+    PROXY_KEY: "test-key-secret-12345",
+    NVIDIA_API_KEY: "test-nvidia-key-67890",
     RATE_GATE: {
       idFromName: () => "id",
       get: () => ({
@@ -7230,20 +7231,88 @@ test("AUDIT-04: GET /v1/models is not proxied (401 unauthenticated, 404 authenti
     },
   };
 
+  const assertNoSecretLeak = async (response, label) => {
+    const text = await response.text();
+    assert.equal(text.includes(env.PROXY_KEY), false, `${label}: body must not leak PROXY_KEY`);
+    assert.equal(text.includes(env.NVIDIA_API_KEY), false, `${label}: body must not leak NVIDIA_API_KEY`);
+    for (const [name, val] of response.headers.entries()) {
+      assert.equal(val.includes(env.PROXY_KEY), false, `${label}: header ${name} must not leak PROXY_KEY`);
+      assert.equal(val.includes(env.NVIDIA_API_KEY), false, `${label}: header ${name} must not leak NVIDIA_API_KEY`);
+    }
+    return text;
+  };
+
+  // 1. Unauthenticated GET /v1/models -> 401
   const unauth = await worker.fetch(
     new Request("https://proxy.local/v1/models", { method: "GET" }),
     env
   );
   assert.equal(unauth.status, 401, "unauthenticated /v1/models must be 401");
+  const unauthText = await assertNoSecretLeak(unauth, "unauthenticated /v1/models");
+  assert.equal(unauthText, "Unauthorized", "unauthenticated body must be 'Unauthorized'");
+  assert.equal(rateGateTouched, false, "the Durable Object must not be reached");
 
+  // 2. Invalid Bearer credentials GET /v1/models -> 401
+  const invalidBearer = await worker.fetch(
+    new Request("https://proxy.local/v1/models", {
+      method: "GET",
+      headers: { Authorization: "Bearer wrong-key" },
+    }),
+    env
+  );
+  assert.equal(invalidBearer.status, 401, "invalid Bearer token on /v1/models must be 401");
+  const invalidBearerText = await assertNoSecretLeak(invalidBearer, "invalid Bearer /v1/models");
+  assert.equal(invalidBearerText, "Unauthorized");
+  assert.equal(rateGateTouched, false, "the Durable Object must not be reached");
+
+  // 3. Invalid x-proxy-key credentials GET /v1/models -> 401
+  const invalidXKey = await worker.fetch(
+    new Request("https://proxy.local/v1/models", {
+      method: "GET",
+      headers: { "x-proxy-key": "wrong-proxy-key" },
+    }),
+    env
+  );
+  assert.equal(invalidXKey.status, 401, "invalid x-proxy-key on /v1/models must be 401");
+  const invalidXKeyText = await assertNoSecretLeak(invalidXKey, "invalid x-proxy-key /v1/models");
+  assert.equal(invalidXKeyText, "Unauthorized");
+  assert.equal(rateGateTouched, false, "the Durable Object must not be reached");
+
+  // 4. Valid credentials GET /v1/models -> 404 (valid auth does NOT make unsupported route valid)
   const authed = await worker.fetch(
     new Request("https://proxy.local/v1/models", {
       method: "GET",
-      headers: { Authorization: "Bearer test-key" },
+      headers: { Authorization: "Bearer test-key-secret-12345" },
     }),
     env
   );
   assert.equal(authed.status, 404, "authenticated GET /v1/models must be 404");
+  const authedText = await assertNoSecretLeak(authed, "authenticated /v1/models");
+  assert.equal(authedText, "Not found", "authenticated unsupported body must be 'Not found'");
+  assert.equal(rateGateTouched, false, "the Durable Object must not be reached");
+
+  // 5. Valid credentials with unsupported methods or paths -> 404
+  const unsupportedMethods = ["GET", "PUT", "DELETE", "PATCH"];
+  for (const method of unsupportedMethods) {
+    const res = await worker.fetch(
+      new Request("https://proxy.local/v1/chat/completions", {
+        method,
+        headers: { Authorization: "Bearer test-key-secret-12345" },
+      }),
+      env
+    );
+    assert.equal(res.status, 404, `authenticated ${method} /v1/chat/completions must be 404`);
+    assert.equal(rateGateTouched, false, "the Durable Object must not be reached");
+  }
+
+  const outOfPath = await worker.fetch(
+    new Request("https://proxy.local/v2/models", {
+      method: "POST",
+      headers: { Authorization: "Bearer test-key-secret-12345" },
+    }),
+    env
+  );
+  assert.equal(outOfPath.status, 404, "authenticated POST outside /v1/ must be 404");
   assert.equal(rateGateTouched, false, "the Durable Object must not be reached");
 });
 
