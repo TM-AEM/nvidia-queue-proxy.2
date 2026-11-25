@@ -91,9 +91,8 @@ npm test
 npx wrangler deploy --dry-run
 ```
 
-`npm test` runs `node --test test/batch1.test.js test/runtime.test.js`, which
-uses Miniflare (`miniflare` in `package.json`) to exercise the Worker and the
-Durable Object locally. The dry-run command performs no deployment and makes no
+`npm test` runs `node --test test/batch1.test.js test/runtime.test.js test/smoke.test.js test/workflow-security.test.js`, which
+exercises unit behavior, Miniflare (`miniflare` in `package.json`) against the Worker and Durable Object locally, smoke-test URL/HTTP validators, and workflow security guards. The dry-run command performs no deployment and makes no
 changes to Cloudflare resources.
 
 ## Configuration
@@ -509,27 +508,41 @@ reachability, which cannot be checked without a billed inference call.
 ## Post-deployment smoke check
 
 Run only after an authorized deployment, against the deployed URL. The smoke-test
-plan consists strictly of zero-upstream, non-billable validation checks that verify
+plan consists strictly of five zero-upstream, non-billable `GET` validation checks that verify
 the Worker's contract, health, readiness, authentication rejection, and unsupported-route
-handling without consuming inference quota or contacting NVIDIA upstream.
+handling without consuming inference quota or contacting NVIDIA upstream. Neither this
+document nor local test runs claim that the live production workflow has passed.
 
 Never paste the proxy key on a command line where it would be recorded in shell
-history; read it from an environment variable that is not echoed.
+history or visible in process arguments; read it from an environment variable or
+a `0600` (`umask 077`) `curl --config` file that is cleaned up on exit and never echoed.
 
 ### Smoke-test contract matrix
 
-| # | Check Name | Method & Path | Authentication Requirement | Expected Status | Expected Response Shape | Contacts NVIDIA Upstream |
+| # | Check Name | Method & Path | Authentication Requirement | Expected Status | Expected Exact Body | Contacts NVIDIA Upstream |
 |---|---|---|---|---|---|---|
-| 1 | Health Probe | `GET /health` | None (unauthenticated) | `200 OK` | `{"ok":true}` | **No** (0 requests) |
-| 2 | Readiness Probe | `GET /ready` | None (unauthenticated) | `200 OK` (when ready) / `503` (if unready) | `{"ready":true,"checks":{"proxy_key":true,"upstream_key":true,"rate_gate":true}}` | **No** (0 requests) |
-| 3 | Unauthenticated Route Security | `GET /v1/models` | None (unauthenticated / missing credentials) | `401 Unauthorized` | Plain text: `Unauthorized` | **No** (0 requests) |
-| 4 | Invalid Credentials Security | `GET /v1/models` | Invalid credentials (e.g. `Bearer invalid-dummy-token`) | `401 Unauthorized` | Plain text: `Unauthorized` | **No** (0 requests) |
-| 5 | Authenticated Unsupported Route | `GET /v1/models` | Valid credentials (`Bearer ${PROXY_KEY}`) | `404 Not Found` | Plain text: `Not found` | **No** (0 requests) |
+| 1 | Check A — Health Probe | `GET /health` | None (unauthenticated) | `200 OK` | `{"ok":true}` | **No** (0 requests) |
+| 2 | Check B — Readiness Probe | `GET /ready` | None (unauthenticated) | `200 OK` (when ready) / `503` (if unready) | `{"ready":true,"checks":{"proxy_key":true,"upstream_key":true,"rate_gate":true}}` | **No** (0 requests) |
+| 3 | Check C — Unauthenticated Route Security | `GET /v1/models` | None (unauthenticated / missing credentials) | `401 Unauthorized` | Plain text: `Unauthorized` | **No** (0 requests) |
+| 4 | Check D — Invalid Credentials Security | `GET /v1/models` | Invalid credentials (e.g. `Bearer invalid-dummy-token`) | `401 Unauthorized` | Plain text: `Unauthorized` | **No** (0 requests) |
+| 5 | Check E — Authenticated Unsupported Route (Mandatory) | `GET /v1/models` | Valid credentials (`Bearer ${PROXY_KEY}`) | `404 Not Found` | Plain text: `Not found` | **No** (0 requests) |
 
-> **Contract Rule**: Valid authentication does **not** make an unsupported route valid.
-> `GET /v1/models` is intentionally unsupported and returns HTTP 404 without reaching the
-> Durable Object or contacting upstream. Do not substitute production inference requests
-> (`POST /v1/chat/completions`) for post-deployment smoke verification.
+> **Contract Rules**:
+> - Valid authentication does **not** make an unsupported route valid.
+>   `GET /v1/models` is intentionally unsupported and returns HTTP 404 (`Not found`) without
+>   reaching the Durable Object or contacting upstream. Do not substitute production inference
+>   requests (`POST /v1/chat/completions`) for post-deployment smoke verification.
+> - **Check E is mandatory and fails closed:** `.github/workflows/production-smoke-test.yml`
+>   fails with a non-zero exit code if GitHub Actions `secrets.PROXY_KEY` is missing or empty,
+>   and supplies the token to `curl` via a temporary `0600` `--config` file (`umask 077`) so
+>   the secret never appears in `curl` process arguments.
+> - **Separate secret stores (`env.PROXY_KEY` vs. `secrets.PROXY_KEY`):** Check B (`/ready`)
+>   verifies only the **Cloudflare Worker runtime binding `env.PROXY_KEY`** (set via
+>   `wrangler secret put PROXY_KEY`). Check E reads the **GitHub Actions `secrets.PROXY_KEY`**
+>   from a scope visible to `.github/workflows/production-smoke-test.yml` (repository secrets,
+>   because that job intentionally does not attach `environment: production`). If `PROXY_KEY`
+>   is stored only in the `production` GitHub environment, Check B can still succeed while
+>   Check E fails closed with a clear missing-secret error instead of silently skipping.
 
 ### Executable smoke-check commands
 
@@ -553,9 +566,20 @@ curl -s -S -o /dev/null -w "%{http_code}\n" \
 # Expected output: 401 (payload: Unauthorized)
 
 # Check 5: Authenticated Unsupported Route (valid credentials, zero upstream calls)
-curl -s -S -o /dev/null -w "%{http_code}\n" \
-  -H "Authorization: Bearer ${PROXY_KEY}" \
-  https://<deployed-host>/v1/models
+# Uses a private 0600 curl config file so PROXY_KEY does not appear in process arguments.
+(
+  umask 077
+  CFG=$(mktemp)
+  trap 'rm -f "$CFG"' EXIT
+  node -e '
+    const fs = require("node:fs");
+    const key = process.env.PROXY_KEY || "";
+    if (!key.trim() || /[\r\n\0]/.test(key)) process.exit(1);
+    const escaped = key.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+    fs.writeFileSync(process.argv[1], `header = "Authorization: Bearer ${escaped}"\n`, { mode: 0o600 });
+  ' "$CFG"
+  curl -s -S --config "$CFG" -o /dev/null -w "%{http_code}\n" https://<deployed-host>/v1/models
+)
 # Expected output: 404 (payload: Not found)
 ```
 
@@ -688,13 +712,15 @@ Complete these in order for an authorized release:
 3. **Authorized deployment** (this task: **NOT performed**) — deploy via
    `npm run deploy` only with explicit authorization.
 4. **Post-deployment smoke test** (this task: **NOT performed**) — run the
-   "Post-deployment smoke check" commands against the deployed host. The
-   `/health` and `/ready` checks are free and call no upstream; the optional
-   authenticated `POST /v1/chat/completions` step consumes one upstream
-   inference request and should be run only when acceptable.
+   five `GET`-only checks in "Post-deployment smoke check" against the deployed
+   host (`/health`, `/ready`, unauthenticated `/v1/models`, invalid-token
+   `/v1/models`, and mandatory authenticated `/v1/models` via GitHub Actions
+   `secrets.PROXY_KEY`). All five checks are non-billable and make zero
+   upstream inference requests.
 5. **Confirm secrets and bindings** (this task: **NOT performed**) — verify
-   `PROXY_KEY`, `NVIDIA_API_KEY`, and the `RATE_GATE` Durable Object binding are
-   present via `/ready` and `wrangler` configuration.
+   Cloudflare Worker `PROXY_KEY`, `NVIDIA_API_KEY`, and `RATE_GATE` are present
+   via `/ready` (Check B), and verify GitHub Actions `secrets.PROXY_KEY` is
+   accessible to `production-smoke-test.yml` via Check E (`404 Not found`).
 
 ## Continuous integration and deployment
 
@@ -722,7 +748,11 @@ CI and production deployment are **deliberately separated**:
 - **Deploy.** Only after the checks and the environment approval, the workflow
   runs `npm run deploy` using `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`,
   then records the deployed commit SHA and workflow run URL.
-- **Smoke test.** An automated post-deploy smoke test verifies `/health` and `/ready` against the deployed endpoint.
+- **Smoke test.** An automated post-deploy smoke test runs five zero-upstream
+  `GET` checks against the deployed endpoint: `/health` (`200`), `/ready`
+  (`200`), unauthenticated `/v1/models` (`401`), invalid-token `/v1/models`
+  (`401`), and mandatory authenticated `/v1/models` (`404 Not found`, failing
+  closed if repository secret `PROXY_KEY` is missing or empty).
 
 > **Owner action required.** Removing the `push` trigger stops *GitHub Actions*
 > from deploying on merge, but the **Cloudflare Git integration is a separate

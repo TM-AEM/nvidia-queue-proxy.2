@@ -14,7 +14,7 @@ const listWorkflows = () =>
 // Robust trigger parser that extracts all declared events across inline scalars,
 // inline arrays, YAML lists, and indented map keys.
 export function parseWorkflowTriggers(yml) {
-  const match = yml.match(/^on:\s*(.*)$/m);
+  const match = yml.match(/^on:[ \t]*(.*)$/m);
   if (!match) return [];
   const inline = match[1].trim();
   const triggers = new Set();
@@ -32,20 +32,27 @@ export function parseWorkflowTriggers(yml) {
     }
   }
 
-  // Scan subsequent indented lines until next top-level unindented key
+  // Scan subsequent indented lines until next top-level unindented key,
+  // recording only entries at the direct child indentation level of `on:`.
   const afterOn = yml.slice(match.index + match[0].length);
   const lines = afterOn.split(/\r?\n/);
+  let baseIndent = null;
   for (const line of lines) {
     if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
     if (/^[^\s]/.test(line)) break;
 
-    const listMatch = line.match(/^\s{1,4}-\s*([a-zA-Z0-9_-]+)/);
+    const indent = line.match(/^[ \t]*/)[0].length;
+    if (baseIndent === null) baseIndent = indent;
+    if (indent > baseIndent) continue;
+
+    const rest = line.slice(indent);
+    const listMatch = rest.match(/^-\s*([a-zA-Z0-9_-]+)/);
     if (listMatch) {
       triggers.add(listMatch[1].trim());
       continue;
     }
 
-    const mapMatch = line.match(/^\s{1,4}([a-zA-Z0-9_-]+)\s*:/);
+    const mapMatch = rest.match(/^([a-zA-Z0-9_-]+)\s*:/);
     if (mapMatch) {
       triggers.add(mapMatch[1].trim());
     }
@@ -251,6 +258,142 @@ test("smoke-test workflow: workflow_run references the actual deploy workflow na
   );
 });
 
+function assertSmokeTriggersRestricted(yml, label) {
+  const triggers = parseWorkflowTriggers(yml);
+  const allowed = new Set(["workflow_dispatch", "workflow_run"]);
+  const unexpected = triggers.filter((t) => !allowed.has(t));
+  assert.equal(
+    unexpected.length,
+    0,
+    `${label}: unexpected triggers found: [${unexpected.join(", ")}]`
+  );
+  assert.ok(triggers.includes("workflow_dispatch"), `${label}: must allow workflow_dispatch`);
+  assert.ok(triggers.includes("workflow_run"), `${label}: must allow workflow_run`);
+  assert.doesNotMatch(
+    triggerBlock(yml),
+    /^\s{4}inputs:/m,
+    `${label}: must not expose unvalidated workflow_dispatch inputs`
+  );
+}
+
+function assertSmokePermissionsReadOnly(yml, label) {
+  assert.match(
+    yml,
+    /^permissions:\s*\n\s{2}contents:\s*read\s*$/m,
+    `${label}: workflow permissions must be restricted to contents: read`
+  );
+  assert.doesNotMatch(
+    yml,
+    /:\s*write\b/,
+    `${label}: must not grant any write permission`
+  );
+}
+
+function assertSmokeExecutionGuards(yml, label) {
+  assert.match(
+    yml,
+    /github\.event_name == 'workflow_dispatch' && github\.ref == 'refs\/heads\/main'/,
+    `${label}: workflow_dispatch must be restricted to refs/heads/main`
+  );
+  assert.match(
+    yml,
+    /github\.event\.workflow_run\.head_branch == 'main'/,
+    `${label}: workflow_run must require head_branch == 'main'`
+  );
+  assert.match(
+    yml,
+    /github\.event\.workflow_run\.conclusion == 'success'/,
+    `${label}: workflow_run must require conclusion == 'success'`
+  );
+  assert.match(
+    yml,
+    /github\.event\.workflow_run\.head_repository\.full_name == github\.repository/,
+    `${label}: workflow_run must verify head_repository.full_name == github.repository`
+  );
+  assert.match(
+    yml,
+    /^\s{10}ref:\s*main\s*$/m,
+    `${label}: actions/checkout must explicitly pin ref: main`
+  );
+  assert.match(
+    yml,
+    /^\s{10}persist-credentials:\s*false\s*$/m,
+    `${label}: actions/checkout must set persist-credentials: false`
+  );
+}
+
+function assertSmokeSecretAndCurlSafety(yml, label) {
+  assert.doesNotMatch(
+    yml,
+    /\bexit\s+0\b/,
+    `${label}: must not contain an exit 0 skip branch`
+  );
+  assert.doesNotMatch(
+    yml,
+    /-H\s+["']Authorization:\s*Bearer\s*\$\{?PROXY_KEY\}?["']/,
+    `${label}: must not pass PROXY_KEY directly in curl -H command-line arguments`
+  );
+  assert.match(
+    yml,
+    /--config\s+"\$CURL_CONFIG"/,
+    `${label}: Check E must pass authorization via private curl --config file`
+  );
+  assert.match(
+    yml,
+    /\bumask\s+077\b/,
+    `${label}: steps handling temporary files/secrets must set umask 077`
+  );
+  assert.doesNotMatch(
+    yml,
+    /\bcurl\b[^\n]*(\s-L\b|\s--location\b|\s-v\b|\s--verbose\b|\s-i\b|\s--include\b)/,
+    `${label}: curl must not follow redirects or enable verbose/header output`
+  );
+  assert.doesNotMatch(
+    yml,
+    /set\s+-[a-zA-Z]*x|continue-on-error|\|\|\s*true|upload-artifact/,
+    `${label}: must not enable shell xtrace, continue-on-error, error suppression, or artifact upload`
+  );
+  assert.match(
+    yml,
+    /node scripts\/smoke-http-validate\.js unauth-models "\$HTTP_CODE" "\$BODY_FILE"/,
+    `${label}: Check C must pass captured body file to validator`
+  );
+  assert.match(
+    yml,
+    /node scripts\/smoke-http-validate\.js invalid-auth-models "\$HTTP_CODE" "\$BODY_FILE"/,
+    `${label}: Check D must pass captured body file to validator`
+  );
+  assert.match(
+    yml,
+    /node scripts\/smoke-http-validate\.js auth-models "\$HTTP_CODE" "\$BODY_FILE"/,
+    `${label}: Check E must pass captured body file to validator`
+  );
+  // Ensure secrets are only referenced in env: blocks, not interpolated directly into run: scripts
+  const runBlocks = yml.match(/^\s+run:\s*\|\n(?:\s{10}.*\n|\s*\n)*/gm) ?? [];
+  for (const block of runBlocks) {
+    assert.doesNotMatch(
+      block,
+      /\$\{\{\s*secrets\./,
+      `${label}: run script must not interpolate GitHub secrets expressions directly`
+    );
+  }
+}
+
+test("smoke-test workflow: triggers, permissions, guards, secret handling, and fail-closed checks", () => {
+  const smoke = readWorkflow("production-smoke-test.yml");
+  assertSmokeTriggersRestricted(smoke, "production-smoke-test.yml");
+  assertSmokePermissionsReadOnly(smoke, "production-smoke-test.yml");
+  assertSmokeExecutionGuards(smoke, "production-smoke-test.yml");
+  assertSmokeSecretAndCurlSafety(smoke, "production-smoke-test.yml");
+  assert.doesNotMatch(
+    smoke,
+    /^\s{4}environment:\s*$/m,
+    "production-smoke-test.yml: must not attach environment: production unintentionally"
+  );
+  assert.match(smoke, /concurrency:\s*\n\s{2}group:\s*production-smoke-test/m);
+  assert.match(smoke, /timeout-minutes:\s*5\b/);
+});
+
 // ---------------------------------------------------------------------------
 // Supply-chain: every third-party action must be pinned to an immutable commit
 // SHA. A mutable tag (`@v4`) can be repointed by the upstream owner and would
@@ -410,6 +553,72 @@ const mutations = [
 for (const { name, yml, check } of mutations) {
   test(`mutation: ${name}`, () => {
     assert.notEqual(yml, DEPLOY, "mutation must actually change the workflow text");
+    assert.throws(() => check(yml), `the guard must reject: ${name}`);
+  });
+}
+
+const SMOKE = readWorkflow("production-smoke-test.yml");
+
+const smokeMutations = [
+  {
+    name: "smoke: adding a push trigger is caught",
+    yml: SMOKE.replace(/^on:\n/m, "on:\n  push:\n"),
+    check: (yml) => assertSmokeTriggersRestricted(yml, "mutated-smoke"),
+  },
+  {
+    name: "smoke: adding contents: write permission is caught",
+    yml: SMOKE.replace(/contents:\s*read/, "contents: write"),
+    check: (yml) => assertSmokePermissionsReadOnly(yml, "mutated-smoke"),
+  },
+  {
+    name: "smoke: removing workflow_run head_repository guard is caught",
+    yml: SMOKE.replace(
+      /\s*&&\s*\n\s*github\.event\.workflow_run\.head_repository\.full_name == github\.repository/,
+      ""
+    ),
+    check: (yml) => assertSmokeExecutionGuards(yml, "mutated-smoke"),
+  },
+  {
+    name: "smoke: removing checkout ref: main is caught",
+    yml: SMOKE.replace(/^\s{10}ref:\s*main\n/m, ""),
+    check: (yml) => assertSmokeExecutionGuards(yml, "mutated-smoke"),
+  },
+  {
+    name: "smoke: removing persist-credentials: false is caught",
+    yml: SMOKE.replace(/^\s{10}persist-credentials:\s*false\n/m, ""),
+    check: (yml) => assertSmokeExecutionGuards(yml, "mutated-smoke"),
+  },
+  {
+    name: "smoke: re-introducing Check E exit 0 skip is caught",
+    yml: SMOKE.replace(/exit 1\n(\s+fi\n\n\s+TMP_DIR)/, "exit 0\n$1"),
+    check: (yml) => assertSmokeSecretAndCurlSafety(yml, "mutated-smoke"),
+  },
+  {
+    name: "smoke: passing PROXY_KEY via curl -H CLI arg is caught",
+    yml: SMOKE.replace(
+      /--config "\$CURL_CONFIG"/,
+      '-H "Authorization: Bearer ${PROXY_KEY}"'
+    ),
+    check: (yml) => assertSmokeSecretAndCurlSafety(yml, "mutated-smoke"),
+  },
+  {
+    name: "smoke: enabling curl redirect following (-L) is caught",
+    yml: SMOKE.replace(/curl -s -S \\/, "curl -s -S -L \\"),
+    check: (yml) => assertSmokeSecretAndCurlSafety(yml, "mutated-smoke"),
+  },
+  {
+    name: "smoke: omitting BODY_FILE on Check E validation is caught",
+    yml: SMOKE.replace(
+      /node scripts\/smoke-http-validate\.js auth-models "\$HTTP_CODE" "\$BODY_FILE"/,
+      'node scripts/smoke-http-validate.js auth-models "$HTTP_CODE"'
+    ),
+    check: (yml) => assertSmokeSecretAndCurlSafety(yml, "mutated-smoke"),
+  },
+];
+
+for (const { name, yml, check } of smokeMutations) {
+  test(`mutation: ${name}`, () => {
+    assert.notEqual(yml, SMOKE, "mutation must actually change the smoke workflow text");
     assert.throws(() => check(yml), `the guard must reject: ${name}`);
   });
 }

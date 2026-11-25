@@ -25,11 +25,13 @@ jobs:
       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.head_branch == 'main' &&
-       github.event.workflow_run.conclusion == 'success')
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     steps:
       - name: Check out validation scripts
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: main
           sparse-checkout: scripts
           sparse-checkout-cone-mode: false
           persist-credentials: false
@@ -46,6 +48,7 @@ jobs:
         env:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
+          umask 077
           TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
           trap 'rm -rf "${TMP_DIR:-}"' EXIT
 
@@ -73,6 +76,7 @@ jobs:
         env:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
+          umask 077
           TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
           trap 'rm -rf "${TMP_DIR:-}"' EXIT
 
@@ -100,16 +104,18 @@ jobs:
         env:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
+          umask 077
           TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
           trap 'rm -rf "${TMP_DIR:-}"' EXIT
 
+          BODY_FILE="${TMP_DIR}/body.txt"
           STATUS_FILE="${TMP_DIR}/status.txt"
 
           CURL_EXIT=0
           curl -s -S \
             --connect-timeout 5 \
             --max-time 10 \
-            -o /dev/null \
+            -o "$BODY_FILE" \
             -w "%{http_code}" \
             "${TARGET_URL}/v1/models" > "$STATUS_FILE" || CURL_EXIT=$?
 
@@ -119,23 +125,25 @@ jobs:
           fi
 
           HTTP_CODE=$(cat "$STATUS_FILE")
-          node scripts/smoke-http-validate.js unauth-models "$HTTP_CODE"
+          node scripts/smoke-http-validate.js unauth-models "$HTTP_CODE" "$BODY_FILE"
           echo "Check C passed: received expected HTTP 401 Unauthorized"
 
       - name: "Check D — Invalid Credentials Route Security (GET /v1/models)"
         env:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
         run: |
+          umask 077
           TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
           trap 'rm -rf "${TMP_DIR:-}"' EXIT
 
+          BODY_FILE="${TMP_DIR}/body.txt"
           STATUS_FILE="${TMP_DIR}/status.txt"
 
           CURL_EXIT=0
           curl -s -S \
             --connect-timeout 5 \
             --max-time 10 \
-            -o /dev/null \
+            -o "$BODY_FILE" \
             -w "%{http_code}" \
             -H "Authorization: Bearer invalid-dummy-token" \
             "${TARGET_URL}/v1/models" > "$STATUS_FILE" || CURL_EXIT=$?
@@ -146,7 +154,7 @@ jobs:
           fi
 
           HTTP_CODE=$(cat "$STATUS_FILE")
-          node scripts/smoke-http-validate.js invalid-auth-models "$HTTP_CODE"
+          node scripts/smoke-http-validate.js invalid-auth-models "$HTTP_CODE" "$BODY_FILE"
           echo "Check D passed: received expected HTTP 401 Unauthorized for invalid credentials"
 
       - name: "Check E — Authenticated Unsupported Route (GET /v1/models)"
@@ -154,23 +162,37 @@ jobs:
           TARGET_URL: ${{ steps.validate_url.outputs.target_url }}
           PROXY_KEY: ${{ secrets.PROXY_KEY }}
         run: |
-          if [ -z "$PROXY_KEY" ]; then
-            echo "Optional PROXY_KEY secret not set; skipping Check E."
-            exit 0
+          umask 077
+          if [ -z "${PROXY_KEY:-}" ] || [ -z "${PROXY_KEY//[[:space:]]/}" ]; then
+            echo "::error::Missing or empty PROXY_KEY secret; Check E requires an accessible GitHub Actions PROXY_KEY secret (check repository secret scope, not only the production environment)."
+            exit 1
           fi
 
           TMP_DIR=$(mktemp -d) || { echo "::error::Failed to create temporary directory"; exit 1; }
           trap 'rm -rf "${TMP_DIR:-}"' EXIT
 
+          BODY_FILE="${TMP_DIR}/body.txt"
           STATUS_FILE="${TMP_DIR}/status.txt"
+          CURL_CONFIG="${TMP_DIR}/curl.cfg"
+
+          node -e '
+            const fs = require("node:fs");
+            const key = process.env.PROXY_KEY || "";
+            if (!key.trim() || /[\r\n\0]/.test(key)) {
+              console.error("::error::Invalid PROXY_KEY secret format for HTTP header.");
+              process.exit(1);
+            }
+            const escaped = key.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+            fs.writeFileSync(process.argv[1], `header = "Authorization: Bearer ${escaped}"\n`, { mode: 0o600 });
+          ' "$CURL_CONFIG" || exit 1
 
           CURL_EXIT=0
           curl -s -S \
             --connect-timeout 5 \
             --max-time 10 \
-            -o /dev/null \
+            --config "$CURL_CONFIG" \
+            -o "$BODY_FILE" \
             -w "%{http_code}" \
-            -H "Authorization: Bearer ${PROXY_KEY}" \
             "${TARGET_URL}/v1/models" > "$STATUS_FILE" || CURL_EXIT=$?
 
           if [ "$CURL_EXIT" -ne 0 ]; then
@@ -179,5 +201,5 @@ jobs:
           fi
 
           HTTP_CODE=$(cat "$STATUS_FILE")
-          node scripts/smoke-http-validate.js auth-models "$HTTP_CODE"
+          node scripts/smoke-http-validate.js auth-models "$HTTP_CODE" "$BODY_FILE"
           echo "Check E passed: received expected HTTP 404 Not Found"
